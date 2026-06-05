@@ -28,8 +28,29 @@ except Exception:
     pass
 
 import requests
+import ssl as _ssl
 from dotenv import load_dotenv
 from mattermostdriver import Driver
+import mattermostdriver.websocket as _mmws
+
+# Fix fuer Python 3.13: mattermostdriver 7.3.2 baut den Client-WebSocket-SSL-Kontext
+# faelschlich mit ssl.Purpose.CLIENT_AUTH (= Server-Kontext). Python <=3.12 schluckt das,
+# 3.13 lehnt es ab ("Cannot create a client socket with a PROTOCOL_TLS_SERVER context").
+# Wir ersetzen den ssl-Namen NUR in diesem Modul durch einen Shim, der den korrekten
+# Client-Kontext (SERVER_AUTH) erzwingt. Auf allen Python-Versionen unschaedlich.
+class _SSLClientShim:
+    Purpose = _ssl.Purpose
+    CERT_NONE = _ssl.CERT_NONE
+
+    def create_default_context(self, *a, **k):
+        k["purpose"] = _ssl.Purpose.SERVER_AUTH
+        return _ssl.create_default_context(*a, **k)
+
+    def __getattr__(self, name):
+        return getattr(_ssl, name)
+
+
+_mmws.ssl = _SSLClientShim()
 
 load_dotenv()
 
