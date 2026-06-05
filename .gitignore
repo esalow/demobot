@@ -1,0 +1,23 @@
+# Secrets & lokaler Laufzeit-Zustand (NIE committen)
+.env
+.sessions.json
+.sessions.json.bak
+__pycache__/
+*.pyc
+
+# Laufzeit-Ordner (Dateiaustausch, pro Maschine)
+_inbox/
+_outbox/
+_sent/
+_jobs/
+
+# lokale Scratch-/Test-Dateien
+_tmp_*.py
+test_*.py
+
+# Logs & Temp (nicht ins Repo)
+logs/
+*.log
+_tmp_*
+*.bak
+*.txt
