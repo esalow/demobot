@@ -101,7 +101,18 @@ def _build_cmd(channel, d, stream, extra_append=""):
     sid = _load_session(d, channel)
     if sid:
         cmd += ["--resume", sid]
-    cmd += ["--mcp-config", '{"mcpServers":{}}']
+    # --mcp-config braucht einen DATEI-PFAD. Inline-JSON wird auf Windows ueber den
+    # claude.cmd-Wrapper entwertet (die Quotes gehen verloren -> claude sucht eine Datei
+    # "{mcpServers:{}}" und bricht ab: "MCP config file not found"). Darum eine kleine
+    # leere MCP-Config-Datei schreiben und ihren absoluten Pfad uebergeben.
+    mcp_file = os.path.join(d, ".mcp_empty.json")
+    try:
+        if not os.path.exists(mcp_file):
+            with open(mcp_file, "w", encoding="utf-8") as fh:
+                fh.write('{"mcpServers":{}}')
+    except Exception:
+        pass
+    cmd += ["--mcp-config", mcp_file]
     return cmd
 
 
