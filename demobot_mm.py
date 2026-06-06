@@ -21,6 +21,7 @@ import re
 import logging
 import threading
 import datetime
+from datetime import timezone
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -68,6 +69,7 @@ MM_PORT = int(os.environ.get("MM_PORT", "443"))
 MM_OWNER = os.environ.get("MM_OWNER_USER_ID", "")
 CHANNEL_NAME = os.environ.get("DEMOBOT_CHANNEL_NAME", "demobot")
 MAX_PARALLEL = int(os.environ.get("DEMOBOT_MAX_PARALLEL", "5"))
+SESSION_TTL = int(os.environ.get("DEMOBOT_SESSION_TTL", str(2 * 3600)))  # Default 2h
 
 API_BASE = f"{MM_SCHEME}://{MM_URL}/api/v4"
 AUTH_H = {"Authorization": "Bearer " + MM_TOKEN}
@@ -99,6 +101,57 @@ def _save_state():
     _active_state["task_seq"] = _task_seq[0]
     with open(_STATE_FILE, "w", encoding="utf-8") as fh:
         json.dump(_active_state, fh, ensure_ascii=False, indent=2)
+
+
+def _touch_activity():
+    with _state_lock:
+        _active_state["last_activity"] = datetime.datetime.now(timezone.utc).isoformat(timespec="seconds")
+        _save_state()
+
+
+def _check_and_reset_ttl():
+    """Prüft TTL. Wenn abgelaufen: Hook aufrufen, Session löschen, Meldung posten. Gibt True zurück wenn reset."""
+    with _state_lock:
+        last = _active_state.get("last_activity")
+    if not last:
+        return False
+    try:
+        last_dt = datetime.datetime.fromisoformat(last)
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.replace(tzinfo=timezone.utc)
+        delta = (datetime.datetime.now(timezone.utc) - last_dt).total_seconds()
+    except Exception:
+        return False
+    if delta <= SESSION_TTL:
+        return False
+
+    # TTL überschritten — Hook aufrufen vor Session-Löschen
+    sid = core._load_session(core.dir_for(CHANNEL_NAME), CHANNEL_NAME)
+    if sid:
+        _run_precompact_hook(sid)
+
+    # Session löschen
+    core._save_session(core.dir_for(CHANNEL_NAME), CHANNEL_NAME, None)
+    log.info("Session-TTL überschritten (%.0f min) — Session resettet", delta / 60)
+    _post_text(f"\U0001f504 Neue Session gestartet — letzte Aktivität vor {int(delta / 3600)}h {int((delta % 3600) / 60)}min.")
+    return True
+
+
+def _run_precompact_hook(session_id):
+    """Ruft den PreCompact-Hook manuell auf (vor TTL-Reset)."""
+    hook = r"C:\Users\Lenovo T460p\.claude\scripts\precompact-hook.py"
+    if not os.path.exists(hook):
+        return
+    import subprocess as _sp
+    hook_input = json.dumps({"session_id": session_id, "trigger": "ttl_reset"})
+    try:
+        _sp.run(
+            [r"C:\Users\Lenovo T460p\AppData\Local\Programs\Python\Python313\python.exe", hook],
+            input=hook_input, capture_output=True, text=True, timeout=20
+        )
+        log.info("PreCompact-Hook aufgerufen für Session %s", session_id)
+    except Exception as e:
+        log.warning("PreCompact-Hook fehlgeschlagen: %s", e)
 
 
 def _get_active():
@@ -162,7 +215,7 @@ def _log_dialog(sender, user_text, reply, task_id, active_dir=None,
     active_dir = active_dir or DEMOBOT_DIR
     active = _get_active()
     entry = {
-        "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+        "ts": datetime.datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "task_id": task_id,
         "sender": sender,
         "projekt": active["name"],
@@ -472,6 +525,8 @@ def _handle_post(post, sender_name):
     if not text and not incoming:
         return
 
+    _check_and_reset_ttl()
+    _touch_activity()
     active = _get_active()
     log.info("[demobot:%s] %s: %s %s", active["name"], sender_name, text,
              f"[+{len(incoming)} Datei]" if incoming else "")

@@ -267,7 +267,7 @@ def archive_sent(channel, pfade):
     d = dir_for(channel)
     sent = os.path.join(d, "_sent")
     os.makedirs(sent, exist_ok=True)
-    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
     for p in pfade:
         if os.path.isfile(p):
             try:
