@@ -20,6 +20,7 @@ import time
 import re
 import logging
 import threading
+import datetime
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -70,7 +71,119 @@ MAX_PARALLEL = int(os.environ.get("DEMOBOT_MAX_PARALLEL", "5"))
 
 API_BASE = f"{MM_SCHEME}://{MM_URL}/api/v4"
 AUTH_H = {"Authorization": "Bearer " + MM_TOKEN}
-INBOX = os.path.join(core.dir_for(CHANNEL_NAME), "_inbox")
+DEMOBOT_DIR = core.dir_for(CHANNEL_NAME)
+INBOX = os.path.join(DEMOBOT_DIR, "_inbox")
+OUTBOX = os.path.join(DEMOBOT_DIR, "_outbox")
+DIALOG_LOG = os.path.join(DEMOBOT_DIR, "logs", "dialog.jsonl")
+
+# --- Aktives Projekt/Vorgang-State ---
+_STATE_FILE = os.path.join(DEMOBOT_DIR, "_bot_state.json")
+_state_lock = threading.Lock()
+_active_state = {"name": CHANNEL_NAME, "type": "kanal", "dir": DEMOBOT_DIR}
+
+
+def _load_state():
+    global _active_state
+    with _state_lock:
+        if os.path.exists(_STATE_FILE):
+            try:
+                data = json.load(open(_STATE_FILE, encoding="utf-8"))
+                _active_state.update(data)
+                # Task-Counter wiederherstellen
+                _task_seq[0] = data.get("task_seq", 0)
+            except Exception:
+                pass
+
+
+def _save_state():
+    _active_state["task_seq"] = _task_seq[0]
+    with open(_STATE_FILE, "w", encoding="utf-8") as fh:
+        json.dump(_active_state, fh, ensure_ascii=False, indent=2)
+
+
+def _get_active():
+    with _state_lock:
+        return dict(_active_state)
+
+
+def _set_active(name, typ, directory):
+    with _state_lock:
+        _active_state["name"] = name
+        _active_state["type"] = typ
+        _active_state["dir"] = directory
+        _save_state()
+
+
+def _create_projekt(name, d):
+    os.makedirs(os.path.join(d, "_inbox"), exist_ok=True)
+    os.makedirs(os.path.join(d, "_outbox"), exist_ok=True)
+    claude_md = os.path.join(d, "CLAUDE.md")
+    if not os.path.exists(claude_md):
+        with open(claude_md, "w", encoding="utf-8") as fh:
+            fh.write(f"# {name}\n\nVia Mattermost-Demobot angelegt am "
+                     f"{datetime.date.today().isoformat()}.\n")
+    _register_in_registry(name, typ="projekt", directory=d)
+
+
+def _create_vorgang(name, d):
+    os.makedirs(d, exist_ok=True)
+    vorgang_md = os.path.join(d, "VORGANG.md")
+    if not os.path.exists(vorgang_md):
+        with open(vorgang_md, "w", encoding="utf-8") as fh:
+            fh.write(f"# Vorgang: {name}\n\nAngelegt via Mattermost-Demobot am "
+                     f"{datetime.date.today().isoformat()}.\n\n## Einträge\n\n")
+    status_json = os.path.join(d, "status.json")
+    if not os.path.exists(status_json):
+        with open(status_json, "w", encoding="utf-8") as fh:
+            json.dump({"name": name, "status": "offen",
+                       "erstellt": datetime.date.today().isoformat(),
+                       "working_path": d}, fh, ensure_ascii=False, indent=2)
+    _register_in_registry(name, typ="vorgang", directory=d)
+
+
+def _register_in_registry(name, typ, directory):
+    registry = os.path.join(core.CLAUDE_META, "project_registry.md")
+    if not os.path.exists(registry):
+        return
+    try:
+        content = open(registry, encoding="utf-8").read()
+        if name in content:
+            return
+        line = f"| {name} | {typ} | {directory} | remote angelegt {datetime.date.today().isoformat()} |\n"
+        with open(registry, "a", encoding="utf-8") as fh:
+            fh.write(line)
+    except Exception:
+        pass
+
+
+def _log_dialog(sender, user_text, reply, task_id, active_dir=None,
+                files_in=None, files_out=None, status="fertig"):
+    os.makedirs(os.path.dirname(DIALOG_LOG), exist_ok=True)
+    active_dir = active_dir or DEMOBOT_DIR
+    active = _get_active()
+    entry = {
+        "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+        "task_id": task_id,
+        "sender": sender,
+        "projekt": active["name"],
+        "typ": active["type"],
+        "in": user_text or "",
+        "files_in": [os.path.basename(p) for p in (files_in or [])],
+        "files_source": INBOX,
+        "out": reply or "",
+        "files_out": [os.path.basename(p) for p in (files_out or [])],
+        "status": status,
+    }
+    with open(DIALOG_LOG, "a", encoding="utf-8", errors="replace") as fh:
+        fh.write(json.dumps(entry, ensure_ascii=True) + "\n")
+    # Doppelt schreiben: _remote_log.jsonl im Zielprojekt (nur wenn nicht demobot selbst)
+    if active_dir != DEMOBOT_DIR:
+        remote_log = os.path.join(active_dir, "_remote_log.jsonl")
+        try:
+            with open(remote_log, "a", encoding="utf-8", errors="replace") as fh:
+                fh.write(json.dumps(entry, ensure_ascii=True) + "\n")
+        except Exception:
+            pass
 
 driver = None
 BOT_USER_ID = None
@@ -164,7 +277,9 @@ def _post_file(path):
 def _next_tid():
     with _task_lock:
         _task_seq[0] += 1
-        return _task_seq[0]
+        tid = _task_seq[0]
+    _save_state()
+    return tid
 
 
 def _render_live(tk):
@@ -209,10 +324,13 @@ def _stop(tid):
     return f"⏹️ #{tid} wird abgebrochen."
 
 
-def _process(text, files):
+def _process(text, files, sender="user"):
+    active = _get_active()
+    work_dir = active["dir"]
     tid = _next_tid()
+    proj_label = "" if active["name"] == CHANNEL_NAME else f" [{active['name']}]"
     title = (text.splitlines()[0][:55] if text else ("Datei-Aufgabe" if files else "Aufgabe"))
-    post = _create_post(f"▶️ **#{tid}** läuft … _{title}_")
+    post = _create_post(f"▶️ **#{tid}**{proj_label} läuft … _{title}_")
     tk = {"id": tid, "title": title, "status": "läuft", "proc": None,
           "post_id": post["id"], "steps": [], "last": 0.0}
     with _task_lock:
@@ -231,13 +349,27 @@ def _process(text, files):
         if tk["status"] == "abgebrochen":
             return
         try:
-            reply, outfiles = core.run_stream(CHANNEL_NAME, text, files,
-                                              on_progress=on_progress, on_start=on_start)
+            reply, outfiles = core.run_stream(
+                CHANNEL_NAME, text, files,
+                on_progress=on_progress, on_start=on_start,
+                work_dir=work_dir, inbox_dir=INBOX, outbox_dir=OUTBOX)
             if tk["status"] == "abgebrochen":
                 _patch(tk["post_id"], f"⏹️ **#{tid}** abgebrochen — _{title}_")
+                _log_dialog(sender, text, None, tid, work_dir, files, [], "abgebrochen")
                 return
             tk["status"] = "fertig"
-            _patch(tk["post_id"], f"✅ **#{tid}** — _{title}_\n\n{(reply or '')[:15000]}")
+            # SWITCH-Signal auswerten (erste Zeile der Antwort)
+            reply_lines = (reply or "").splitlines()
+            if reply_lines and reply_lines[0].startswith("SWITCH:"):
+                parts = reply_lines[0].strip().split(":")
+                if len(parts) == 3:
+                    sw_typ, sw_name = parts[1], parts[2].strip()
+                    if sw_typ == "projekt":
+                        _post_text(_cmd_projekt(sw_name))
+                    elif sw_typ == "vorgang":
+                        _post_text(_cmd_vorgang(sw_name))
+                reply = "\n".join(reply_lines[1:]).strip()
+            _patch(tk["post_id"], f"✅ **#{tid}**{proj_label} — _{title}_\n\n{(reply or '')[:15000]}")
             sent = []
             for p in outfiles:
                 try:
@@ -248,12 +380,50 @@ def _process(text, files):
                     log.exception("Konnte Datei nicht senden: %s", p)
             if sent:
                 core.archive_sent(CHANNEL_NAME, sent)
+            _log_dialog(sender, text, reply, tid, work_dir, files, sent, "fertig")
         except Exception as e:
             log.exception("Verarbeitung fehlgeschlagen")
             tk["status"] = "fehler"
             _patch(tk["post_id"], f"❌ **#{tid}** Fehler — {e}")
+            _log_dialog(sender, text, str(e), tid, work_dir, files, [], "fehler")
         finally:
             tk["proc"] = None
+
+
+def _cmd_projekt(name):
+    if not name:
+        a = _get_active()
+        return f"Aktiv: **{a['name']}** ({a['type']}) → `{a['dir']}`"
+    name = name.strip().replace(" ", "_")
+    d = os.path.join(core.BASE_DIR, name)
+    exists = os.path.isdir(d)
+    if not exists:
+        _create_projekt(name, d)
+        msg = f"📁 Projekt **{name}** angelegt und aktiviert → `{d}`"
+    else:
+        msg = f"📂 Projekt **{name}** aktiviert → `{d}`"
+    _set_active(name, "projekt", d)
+    return msg
+
+
+def _cmd_vorgang(name):
+    if not name:
+        a = _get_active()
+        return f"Aktiv: **{a['name']}** ({a['type']}) → `{a['dir']}`"
+    d = os.path.join(core.VORGANG_BASE, name.upper())
+    exists = os.path.isdir(d)
+    if not exists:
+        _create_vorgang(name.upper(), d)
+        msg = f"📋 Vorgang **{name.upper()}** angelegt und aktiviert → `{d}`"
+    else:
+        msg = f"📋 Vorgang **{name.upper()}** aktiviert → `{d}`"
+    _set_active(name.upper(), "vorgang", d)
+    return msg
+
+
+def _cmd_zurueck():
+    _set_active(CHANNEL_NAME, "kanal", DEMOBOT_DIR)
+    return f"↩️ Zurück zu **{CHANNEL_NAME}** (Kanal-Standard)"
 
 
 def _handle_post(post, sender_name):
@@ -265,21 +435,47 @@ def _handle_post(post, sender_name):
     low = text.lower().strip()
     low_c = low.rstrip("!?. ")
 
+    # Projekt wechseln — NUR mit führendem /  (ohne Slash = normaler Chat)
+    m = re.match(r"^/projekt\s+(.+)", low_c)
+    if m:
+        _post_text(_cmd_projekt(m.group(1).strip()))
+        return
+    if low_c in {"/projekt", "/project"}:
+        _post_text(_cmd_projekt(""))
+        return
+
+    # Vorgang wechseln — NUR mit /
+    m = re.match(r"^/vorgang\s+(.+)", low_c)
+    if m:
+        _post_text(_cmd_vorgang(m.group(1).strip()))
+        return
+    if low_c in {"/vorgang"}:
+        _post_text(_cmd_vorgang(""))
+        return
+
+    # Zurück zu demobot
+    if low_c in {"/zurück", "/zurueck", "/home"}:
+        _post_text(_cmd_zurueck())
+        return
+
     # Status
     if low_c in STATUS_WORDS or low in STATUS_WORDS:
         _post_text(_list_tasks())
         return
+
     # Stop
     m = re.match(r"(?:stop|unterbrich|abbrechen|abbruch|halt)\s*#?(\d+)", low)
     if m:
         _post_text(_stop(int(m.group(1))))
         return
-    # Sofort ausfuehren — der demobot macht es direkt
+
     if not text and not incoming:
         return
-    log.info("[demobot] %s: %s %s", sender_name, text,
+
+    active = _get_active()
+    log.info("[demobot:%s] %s: %s %s", active["name"], sender_name, text,
              f"[+{len(incoming)} Datei]" if incoming else "")
-    _process(text, incoming)
+    _process(text, incoming, sender=sender_name)
 
 
 def _run_task(post, sender):
@@ -314,6 +510,10 @@ async def event_handler(message):
 def main():
     global driver, BOT_USER_ID
     os.makedirs(INBOX, exist_ok=True)
+    os.makedirs(OUTBOX, exist_ok=True)
+    _load_state()
+    active = _get_active()
+    log.info("State geladen: aktiv=%s (%s) → %s", active["name"], active["type"], active["dir"])
     while True:
         try:
             driver = _make_driver()

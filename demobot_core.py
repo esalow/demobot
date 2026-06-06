@@ -24,18 +24,29 @@ BASE_DIR = os.environ.get("DEMOBOT_BASE", r"C:\projekte")
 CLAUDE_CMD = os.environ.get(
     "CLAUDE_CMD", r"C:\Users\Lenovo T460p\AppData\Roaming\npm\claude.cmd")
 TIMEOUT = int(os.environ.get("DEMOBOT_TIMEOUT", "240"))
+VORGANG_BASE = os.environ.get("DEMOBOT_VORGANG_BASE",
+    r"G:\Meine Ablage\ESALOW-Archiv\_vorgaenge")
+CLAUDE_META = os.environ.get("DEMOBOT_CLAUDE_META", r"C:\projekte\claude-meta")
 
 APPEND_SYSTEM = (
-    "Du arbeitest in diesem Verzeichnis und darfst alles. "
-    "Hochgeladene Dateien des Users liegen in _inbox/. "
-    "Dateien die der User ERHALTEN soll, kopiere nach _outbox/ "
-    "(alles dort wird automatisch in den Chat gesendet). "
-    "WICHTIG: Mache NIEMALS blockierende Wartezeiten (kein 'sleep', kein Warten, "
-    "keine Endlosschleifen) — das friert den Bot ein. Zeitgesteuerte Erinnerungen "
-    "oder Timer kannst du NICHT selbst umsetzen; sag das ehrlich, statt zu warten. "
-    "Antworte IMMER mit einer Text-Nachricht auf Deutsch (echte Umlaute) — auch bei "
-    "Smalltalk/Begruessung (z.B. 'bist du da?' -> 'Ja, bin am Start!'). Sei freundlich "
-    "und gespraechig. Fuehre Aufgaben direkt aus und sag dann kurz, was du gemacht hast."
+    "KONTEXT: Du wirst per Mattermost gesteuert. Nachrichten kommen oft von Sprach-"
+    "Transkription (Handy-Mikrofon) — sie koennen unpraezise, umgangssprachlich oder "
+    "fehlerhaft transkribiert sein. Interpretiere semantisch, nicht woertlich. "
+    "Die Telefonzentrale (demobot-Kanal) ist KEIN Arbeitsverzeichnis. "
+    "Aktuelles Arbeitsverzeichnis: '{work_dir}'. Dort gehoeren dauerhafte Ergebnisse hin. "
+    "Uploads des Users: {inbox_dir}. "
+    "Was sofort in den Chat soll: nach {outbox_dir} kopieren (wird automatisch gesendet). "
+    "Bei Unklarheit kurz fragen ob Ergebnis Chat oder Projekt. "
+    "PROJEKT-WECHSEL: Wenn der User erkennbar ein anderes Projekt oder einen Vorgang "
+    "oeffnen/wechseln moechte, schreibe als ERSTE Zeile deiner Antwort exakt: "
+    "SWITCH:projekt:verzeichnisname ODER SWITCH:vorgang:NAME — dann normaler Text. "
+    "Den Verzeichnisnamen aus dem Kontext ableiten (z.B. 'umsatz grizzly' -> 'umsatz_grizzly', "
+    "'ohm 73' -> 'OHM73'). Nur SWITCH schreiben wenn eindeutig ein Wechsel gewuenscht ist. "
+    "Quellen-Registry: {sources_json} — lies wenn du wissen willst wo Daten liegen. "
+    "Projekt-Registry (Metadaten, unvollstaendig): {project_registry} "
+    "ALLE Projekte: Verzeichnis C:\\projekte\\ auflisten (list_directory oder glob). "
+    "Bei Projekt-Fragen immer das echte Verzeichnis nehmen, Registry nur fuer Metadaten. "
+    "WICHTIG: Keine blockierenden Wartezeiten. Antworte auf Deutsch mit echten Umlauten."
 )
 
 
@@ -77,7 +88,7 @@ def _save_session(d, channel, sid):
             json.dump(data, fh, ensure_ascii=False, indent=2)
 
 
-def _build_cmd(channel, d, stream, extra_append=""):
+def _build_cmd(channel, d, stream, extra_append="", inbox_dir=None, outbox_dir=None):
     """Baut die claude-Befehlszeile (OHNE Prompt — der kommt via stdin).
 
     WICHTIG: --append-system-prompt MUSS einzeilig sein. Ein Zeilenumbruch im
@@ -85,7 +96,13 @@ def _build_cmd(channel, d, stream, extra_append=""):
     Plaintext zurueck und ignoriert --output-format stream-json. Darum hier alle
     Whitespace-/Newline-Folgen zu einzelnen Leerzeichen kollabieren.
     """
-    append = (APPEND_SYSTEM +
+    _inbox = inbox_dir or os.path.join(d, "_inbox")
+    _outbox = outbox_dir or os.path.join(d, "_outbox")
+    _sources = os.path.join(CLAUDE_META, "sources.json")
+    _registry = os.path.join(CLAUDE_META, "project_registry.md")
+    append = (APPEND_SYSTEM.format(
+                  work_dir=d, inbox_dir=_inbox, outbox_dir=_outbox,
+                  sources_json=_sources, project_registry=_registry) +
               f"\n\nDu laeufst auf Maschine '{MACHINE}', Kanal '{channel}', "
               f"Arbeitsverzeichnis '{d}'. Wenn jemand fragt WER oder WO (welcher "
               f"Rechner) eine Aufgabe bearbeitet hat, nenne diese Maschine: '{MACHINE}'.")
@@ -148,30 +165,37 @@ def _fmt_tool(b):
     return (f"🔧 {name}: {detail}")[:180]
 
 
-def _collect_outbox(d):
-    outbox = os.path.join(d, "_outbox")
+def _collect_outbox(outbox):
+    if not os.path.isdir(outbox):
+        return []
     return [os.path.join(outbox, f) for f in sorted(os.listdir(outbox))
             if os.path.isfile(os.path.join(outbox, f))]
 
 
 def run_stream(channel, user_text, incoming_files=None, on_progress=None, on_start=None,
-               extra_append=""):
+               extra_append="", work_dir=None, inbox_dir=None, outbox_dir=None):
     """Fuehrt claude LIVE aus. on_progress(text) je Schritt, on_start(proc) sobald
-    der Prozess laeuft (fuer stop). extra_append = zusaetzlicher System-Prompt-Hinweis
-    (z.B. Planungs- vs. Ausfuehrungs-Modus). Gibt (reply_text, outbox_files) zurueck."""
-    d = dir_for(channel)
+    der Prozess laeuft (fuer stop). extra_append = zusaetzlicher System-Prompt-Hinweis.
+    work_dir überschreibt das Arbeitsverzeichnis (für Projekt-Routing).
+    inbox_dir/outbox_dir überschreiben die Datei-Pfade im System-Prompt.
+    Gibt (reply_text, outbox_files) zurueck."""
+    d = work_dir or dir_for(channel)
     if not os.path.isdir(d):
-        return (f"Verzeichnis fuer Kanal '{channel}' existiert nicht: {d}", [])
-    _ensure(d)
+        return (f"Verzeichnis existiert nicht: {d}", [])
+    _inbox = inbox_dir or os.path.join(d, "_inbox")
+    _outbox = outbox_dir or os.path.join(d, "_outbox")
+    os.makedirs(_inbox, exist_ok=True)
+    os.makedirs(_outbox, exist_ok=True)
     incoming_files = incoming_files or []
     prompt = (user_text or "").strip()
     if incoming_files:
-        prompt += ("\n\n[System: Dateien in _inbox/: "
+        prompt += ("\n\n[System: Uploads in " + _inbox + ": "
                    + ", ".join(os.path.basename(p) for p in incoming_files) + "]")
     if not prompt:
         return ("", [])
 
-    cmd = _build_cmd(channel, d, stream=True, extra_append=extra_append)
+    cmd = _build_cmd(channel, d, stream=True, extra_append=extra_append,
+                     inbox_dir=_inbox, outbox_dir=_outbox)
     # Prompt via stdin (NICHT -p): mehrzeilige Aufgaben bleiben erhalten und
     # umgehen den Batch-Wrapper-Bug (Newline im Argument -> Plaintext).
     proc = subprocess.Popen(cmd, cwd=d, stdin=subprocess.PIPE,
@@ -235,7 +259,7 @@ def run_stream(channel, user_text, incoming_files=None, on_progress=None, on_sta
 
     if new_sid:
         _save_session(d, channel, new_sid)
-    return (reply or "(fertig, keine Textantwort)", _collect_outbox(d))
+    return (reply or "(fertig, keine Textantwort)", _collect_outbox(_outbox))
 
 
 def archive_sent(channel, pfade):
