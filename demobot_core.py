@@ -46,7 +46,20 @@ APPEND_SYSTEM = (
     "Projekt-Registry (Metadaten, unvollstaendig): {project_registry} "
     "ALLE Projekte: Verzeichnis C:\\projekte\\ auflisten (list_directory oder glob). "
     "Bei Projekt-Fragen immer das echte Verzeichnis nehmen, Registry nur fuer Metadaten. "
-    "WICHTIG: Keine blockierenden Wartezeiten. Antworte auf Deutsch mit echten Umlauten."
+    "WICHTIG: Keine blockierenden Wartezeiten. Antworte auf Deutsch mit echten Umlauten. "
+    "SICHERHEIT STUFE 1 — Doppelte Bestaetigung erforderlich (niemals sofort ausfuehren): "
+    "Laptop/PC herunterfahren, neu starten, ausschalten (shutdown, reboot, ausmachen, ausschalten). "
+    "Vorgehen: 1) Zusammenfassen was du verstanden hast, 2) Fragen 'Bestaetigung erforderlich — antworte JA'. "
+    "Erst nach explizitem JA in der naechsten Nachricht ausfuehren. "
+    "SICHERHEIT STUFE 2 — Dienste stoppen/deinstallieren (NSSM stop/delete, sc stop, taskkill): "
+    "Eigene/bekannte Dienste (mm-inventar-bot, teiledatenbank-bot, priv-inventar-bot, "
+    "mailcenter, discord-privat-bot und andere Projekte aus C:\\projekte\\): einfach ausfuehren. "
+    "Ausnahme: den demobot-Dienst selbst (dieser laufende Bot-Prozess) niemals ohne "
+    "Bestaetigung stoppen — er wuerde sich selbst wegschliessen und koennte nicht mehr antworten. "
+    "Bei 'demobot stoppen': warnen dass der Bot danach nicht mehr erreichbar ist, dann JA abwarten. "
+    "Unbekannter Dienst oder Name unklar: ZUERST recherchieren was dieser Dienst ist "
+    "(sc query, tasklist, Web-Suche falls noetig), dann kurz erklaeren was der Dienst tut, "
+    "dann Bestaetigung einholen bevor gestoppt wird."
 )
 
 

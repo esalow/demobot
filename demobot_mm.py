@@ -540,6 +540,39 @@ def _run_task(post, sender):
         log.exception("Fehler bei der Verarbeitung")
 
 
+# Debounce: Nachrichten pro Sender sammeln, 3s warten, dann zusammenführen.
+# Verhindert dass Spracheingabe-Fragmente einzeln verarbeitet werden.
+DEBOUNCE_SECONDS = float(os.environ.get("DEMOBOT_DEBOUNCE", "3.0"))
+_debounce_lock = threading.Lock()
+_debounce_buffers = {}   # sender_id -> {"timer": Timer, "posts": [...], "sender_name": str, "files": [...]}
+
+
+def _flush_debounce(user_id):
+    with _debounce_lock:
+        buf = _debounce_buffers.pop(user_id, None)
+    if not buf:
+        return
+    posts = buf["posts"]
+    sender_name = buf["sender_name"]
+    # Texte zusammenfügen, Leerzeilen zwischen Fragmenten
+    texts = [p.get("message", "").strip() for p in posts if p.get("message", "").strip()]
+    merged_text = "\n".join(texts)
+    # Dateien aus allen Posts sammeln
+    all_file_ids = []
+    for p in posts:
+        for fid in (p.get("file_ids") or []):
+            if fid not in all_file_ids:
+                all_file_ids.append(fid)
+    # Synthetischen Post mit zusammengeführtem Text bauen (Basis = letzter Post)
+    merged_post = dict(posts[-1])
+    merged_post["message"] = merged_text
+    merged_post["file_ids"] = all_file_ids
+    if len(posts) > 1:
+        log.info("[debounce] %d Nachrichten von %s zusammengeführt: %r",
+                 len(posts), sender_name, merged_text[:120])
+    threading.Thread(target=_run_task, args=(merged_post, sender_name), daemon=True).start()
+
+
 async def event_handler(message):
     try:
         data = json.loads(message)
@@ -559,7 +592,18 @@ async def event_handler(message):
     if (post.get("type") or "").startswith("system_"):
         return
     sender_name = (data["data"].get("sender_name") or "").lstrip("@") or "user"
-    threading.Thread(target=_run_task, args=(post, sender_name), daemon=True).start()
+    user_id = post.get("user_id", sender_name)
+    with _debounce_lock:
+        if user_id in _debounce_buffers:
+            # Timer zurücksetzen, Nachricht anhängen
+            _debounce_buffers[user_id]["timer"].cancel()
+            _debounce_buffers[user_id]["posts"].append(post)
+        else:
+            _debounce_buffers[user_id] = {"posts": [post], "sender_name": sender_name}
+        t = threading.Timer(DEBOUNCE_SECONDS, _flush_debounce, args=(user_id,))
+        _debounce_buffers[user_id]["timer"] = t
+        t.daemon = True
+        t.start()
 
 
 def main():
