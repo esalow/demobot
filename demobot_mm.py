@@ -69,6 +69,7 @@ MM_PORT = int(os.environ.get("MM_PORT", "443"))
 MM_OWNER = os.environ.get("MM_OWNER_USER_ID", "")
 CHANNEL_NAME = os.environ.get("DEMOBOT_CHANNEL_NAME", "demobot")
 MAX_PARALLEL = int(os.environ.get("DEMOBOT_MAX_PARALLEL", "5"))
+AUFGABEN_MAX = int(os.environ.get("DEMOBOT_MAX_AUFGABEN", "2"))
 SESSION_TTL = int(os.environ.get("DEMOBOT_SESSION_TTL", str(2 * 3600)))  # Default 2h
 
 API_BASE = f"{MM_SCHEME}://{MM_URL}/api/v4"
@@ -210,13 +211,14 @@ def _register_in_registry(name, typ, directory):
 
 
 def _log_dialog(sender, user_text, reply, task_id, active_dir=None,
-                files_in=None, files_out=None, status="fertig"):
+                files_in=None, files_out=None, status="fertig", aufgabe_id=None):
     os.makedirs(os.path.dirname(DIALOG_LOG), exist_ok=True)
     active_dir = active_dir or DEMOBOT_DIR
     active = _get_active()
     entry = {
         "ts": datetime.datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "task_id": task_id,
+        "aufgabe_id": f"A{aufgabe_id}" if aufgabe_id else None,
         "sender": sender,
         "projekt": active["name"],
         "typ": active["type"],
@@ -240,10 +242,25 @@ def _log_dialog(sender, user_text, reply, task_id, active_dir=None,
 
 driver = None
 BOT_USER_ID = None
-_sem = threading.Semaphore(MAX_PARALLEL)
+_sem = threading.Semaphore(AUFGABEN_MAX)
 _tasks = {}
 _task_lock = threading.Lock()
 _task_seq = [0]
+
+# --- Multi-Aufgaben-State ---
+_aufgaben = {}          # int -> {id, title, session_key, status}
+_aufgabe_seq = [0]
+_cur_aufgabe = [None]   # aktuell aktive Aufgabe-ID (None = Einzel-Modus)
+_await_select = [False] # True = warte auf A1/A2/... nach "zurueck"
+_aufgaben_lock = threading.Lock()
+
+NEUE_RE = re.compile(
+    r"\b(andere|neue|n[aä]chste|zweite|dritte|noch.?eine|au[sß]erdem)\b.{0,20}"
+    r"\b(aufgabe|aufgab|sache|task)\b", re.I)
+REF_RE = re.compile(r"^[Aa#](\d+)\s*(.*)", re.S)
+# Erkennt "zu A1", "Aufgabe A1", "zurück zu a 1", "zu aufgabe 1" irgendwo im Text
+REF_ANYWHERE_RE = re.compile(
+    r"\b(?:zu\s+)?(?:aufgabe\s+)?[Aa]\.?\s*(\d+)\b", re.I)
 
 GO_WORDS = ["deckel drauf", "deckeldrauf", "leg los", "mach es", "ausführen",
             "ausfuehren", "umsetzen", "go", "los", "mach", "jetzt", "run"]
@@ -337,7 +354,8 @@ def _next_tid():
 
 def _render_live(tk):
     icon = {"läuft": "▶️", "fertig": "✅", "abgebrochen": "⏹️", "fehler": "❌"}.get(tk["status"], "▶️")
-    head = f"{icon} **#{tk['id']}** {tk['status']} — _{tk['title']}_"
+    a_label = f" [A{tk['aufgabe_id']}]" if tk.get("aufgabe_id") else ""
+    head = f"{icon} **#{tk['id']}**{a_label} {tk['status']} — _{tk['title']}_"
     steps = tk["steps"][-8:]
     return head + ("\n" + "\n".join(steps) if steps else "")
 
@@ -360,8 +378,39 @@ def _list_tasks():
     for tk in recent:
         last = tk["steps"][-1] if tk["steps"] else ""
         suffix = f" — {last}" if tk["status"] == "läuft" and last else ""
-        lines.append(f"{icons.get(tk['status'], '·')} #{tk['id']} [{tk['status']}] {tk['title']}{suffix}")
+        a_label = f" [A{tk['aufgabe_id']}]" if tk.get("aufgabe_id") else ""
+        lines.append(f"{icons.get(tk['status'], '·')} #{tk['id']}{a_label} [{tk['status']}] {tk['title']}{suffix}")
     return "\n".join(lines)
+
+
+def _open_aufgabe(title):
+    with _aufgaben_lock:
+        _aufgabe_seq[0] += 1
+        aid = _aufgabe_seq[0]
+        _aufgaben[aid] = {"id": aid, "title": title[:50],
+                          "session_key": f"{CHANNEL_NAME}_A{aid}", "status": "aktiv"}
+        _cur_aufgabe[0] = aid
+    return aid
+
+
+def _aufgaben_liste():
+    with _aufgaben_lock:
+        if not _aufgaben:
+            return "Keine aktiven Aufgaben."
+        lines = ["**Aufgaben:**"]
+        for aid, a in sorted(_aufgaben.items()):
+            icon = "▶️" if a["status"] == "aktiv" else "✅"
+            lines.append(f"{icon} **A{aid}** — {a['title']}")
+        lines.append("\n➡️ Antworte mit **A1**, **A2**, ... um fortzusetzen.")
+    return "\n".join(lines)
+
+
+def _get_session_key(aufgabe_id):
+    if aufgabe_id is None:
+        return CHANNEL_NAME
+    with _aufgaben_lock:
+        a = _aufgaben.get(aufgabe_id)
+    return a["session_key"] if a else CHANNEL_NAME
 
 
 def _stop(tid):
@@ -377,15 +426,18 @@ def _stop(tid):
     return f"⏹️ #{tid} wird abgebrochen."
 
 
-def _process(text, files, sender="user"):
+def _process(text, files, sender="user", aufgabe_id=None):
     active = _get_active()
     work_dir = active["dir"]
     tid = _next_tid()
+    session_key = _get_session_key(aufgabe_id)
     proj_label = "" if active["name"] == CHANNEL_NAME else f" [{active['name']}]"
+    aufgabe_label = f" [A{aufgabe_id}]" if aufgabe_id else ""
     title = (text.splitlines()[0][:55] if text else ("Datei-Aufgabe" if files else "Aufgabe"))
-    post = _create_post(f"▶️ **#{tid}**{proj_label} läuft … _{title}_")
+    post = _create_post(f"▶️ **#{tid}**{proj_label}{aufgabe_label} läuft … _{title}_")
     tk = {"id": tid, "title": title, "status": "läuft", "proc": None,
-          "post_id": post["id"], "steps": [], "last": 0.0}
+          "post_id": post["id"], "steps": [], "last": 0.0,
+          "aufgabe_id": aufgabe_id}
     with _task_lock:
         _tasks[tid] = tk
 
@@ -403,12 +455,12 @@ def _process(text, files, sender="user"):
             return
         try:
             reply, outfiles = core.run_stream(
-                CHANNEL_NAME, text, files,
+                session_key, text, files,
                 on_progress=on_progress, on_start=on_start,
                 work_dir=work_dir, inbox_dir=INBOX, outbox_dir=OUTBOX)
             if tk["status"] == "abgebrochen":
                 _patch(tk["post_id"], f"⏹️ **#{tid}** abgebrochen — _{title}_")
-                _log_dialog(sender, text, None, tid, work_dir, files, [], "abgebrochen")
+                _log_dialog(sender, text, None, tid, work_dir, files, [], "abgebrochen", aufgabe_id)
                 return
             tk["status"] = "fertig"
             # SWITCH-Signal auswerten (erste Zeile der Antwort)
@@ -422,7 +474,7 @@ def _process(text, files, sender="user"):
                     elif sw_typ == "vorgang":
                         _post_text(_cmd_vorgang(sw_name))
                 reply = "\n".join(reply_lines[1:]).strip()
-            _patch(tk["post_id"], f"✅ **#{tid}**{proj_label} — _{title}_\n\n{(reply or '')[:15000]}")
+            _patch(tk["post_id"], f"✅ **#{tid}**{proj_label}{aufgabe_label} — _{title}_\n\n{(reply or '')[:15000]}")
             sent = []
             for p in outfiles:
                 try:
@@ -433,12 +485,17 @@ def _process(text, files, sender="user"):
                     log.exception("Konnte Datei nicht senden: %s", p)
             if sent:
                 core.archive_sent(CHANNEL_NAME, sent)
-            _log_dialog(sender, text, reply, tid, work_dir, files, sent, "fertig")
+            _log_dialog(sender, text, reply, tid, work_dir, files, sent, "fertig", aufgabe_id)
+            # Aufgabe als fertig markieren
+            if aufgabe_id:
+                with _aufgaben_lock:
+                    if aufgabe_id in _aufgaben:
+                        _aufgaben[aufgabe_id]["status"] = "fertig"
         except Exception as e:
             log.exception("Verarbeitung fehlgeschlagen")
             tk["status"] = "fehler"
             _patch(tk["post_id"], f"❌ **#{tid}** Fehler — {e}")
-            _log_dialog(sender, text, str(e), tid, work_dir, files, [], "fehler")
+            _log_dialog(sender, text, str(e), tid, work_dir, files, [], "fehler", aufgabe_id)
         finally:
             tk["proc"] = None
 
@@ -479,7 +536,7 @@ def _cmd_zurueck():
     return f"↩️ Zurück zu **{CHANNEL_NAME}** (Kanal-Standard)"
 
 
-def _handle_post(post, sender_name):
+def _handle_post(post, sender_name, aufgabe_id=None):
     user_id = post.get("user_id", "")
     if MM_OWNER and user_id != MM_OWNER:
         return
@@ -530,12 +587,12 @@ def _handle_post(post, sender_name):
     active = _get_active()
     log.info("[demobot:%s] %s: %s %s", active["name"], sender_name, text,
              f"[+{len(incoming)} Datei]" if incoming else "")
-    _process(text, incoming, sender=sender_name)
+    _process(text, incoming, sender=sender_name, aufgabe_id=aufgabe_id)
 
 
-def _run_task(post, sender):
+def _run_task(post, sender, aufgabe_id=None):
     try:
-        _handle_post(post, sender)
+        _handle_post(post, sender, aufgabe_id=aufgabe_id)
     except Exception:
         log.exception("Fehler bei der Verarbeitung")
 
@@ -554,23 +611,96 @@ def _flush_debounce(user_id):
         return
     posts = buf["posts"]
     sender_name = buf["sender_name"]
-    # Texte zusammenfügen, Leerzeilen zwischen Fragmenten
     texts = [p.get("message", "").strip() for p in posts if p.get("message", "").strip()]
     merged_text = "\n".join(texts)
-    # Dateien aus allen Posts sammeln
     all_file_ids = []
     for p in posts:
         for fid in (p.get("file_ids") or []):
             if fid not in all_file_ids:
                 all_file_ids.append(fid)
-    # Synthetischen Post mit zusammengeführtem Text bauen (Basis = letzter Post)
     merged_post = dict(posts[-1])
     merged_post["message"] = merged_text
     merged_post["file_ids"] = all_file_ids
     if len(posts) > 1:
-        log.info("[debounce] %d Nachrichten von %s zusammengeführt: %r",
-                 len(posts), sender_name, merged_text[:120])
-    threading.Thread(target=_run_task, args=(merged_post, sender_name), daemon=True).start()
+        log.info("[debounce] %d Nachrichten zusammengefuehrt: %r", len(posts), merged_text[:120])
+
+    low = merged_text.lower().strip()
+
+    # "zurueck" / "was laeuft" / "aufgaben" → Liste zeigen, auf Auswahl warten
+    if re.match(r"^(zur[uü]ck|zurueck|back|was l[aä]uft|aufgaben|welche aufgabe)", low):
+        with _aufgaben_lock:
+            hat_aufgaben = bool(_aufgaben)
+        if hat_aufgaben:
+            _post_text(_aufgaben_liste())
+            _await_select[0] = True
+            return
+        # keine Aufgaben → normal verarbeiten
+        threading.Thread(target=_run_task, args=(merged_post, sender_name), daemon=True).start()
+        return
+
+    # Auswahl-Modus nach "zurueck": "1" oder "A2" → zu Aufgabe wechseln
+    if _await_select[0]:
+        m = re.match(r"^[Aa#]?(\d+)$", low)
+        if m:
+            aid = int(m.group(1))
+            with _aufgaben_lock:
+                if aid in _aufgaben:
+                    _cur_aufgabe[0] = aid
+                    _await_select[0] = False
+                    _post_text(f"↩️ Weiter mit **A{aid}** — {_aufgaben[aid]['title']}")
+                    return
+        _await_select[0] = False
+
+    # "A1 text", "#1 text", "zu A1 ...", "Aufgabe A1 ..." → zu Aufgabe routen
+    m = REF_RE.match(merged_text.strip())
+    if not m:
+        m2 = REF_ANYWHERE_RE.search(merged_text)
+        if m2:
+            # Referenz irgendwo im Text — ganzen Text als Fortsetzung schicken
+            aid = int(m2.group(1))
+            with _aufgaben_lock:
+                has = aid in _aufgaben
+            if has:
+                _cur_aufgabe[0] = aid
+                _await_select[0] = False
+                threading.Thread(target=_run_task, args=(merged_post, sender_name, aid), daemon=True).start()
+                return
+    if m:
+        aid = int(m.group(1))
+        rest = m.group(2).strip()
+        with _aufgaben_lock:
+            has = aid in _aufgaben
+        if has:
+            _cur_aufgabe[0] = aid
+            _await_select[0] = False
+            if not rest:
+                with _aufgaben_lock:
+                    title = _aufgaben[aid]["title"]
+                _post_text(f"↩️ Weiter mit **A{aid}** — {title}")
+                return
+            merged_post["message"] = rest
+            threading.Thread(target=_run_task, args=(merged_post, sender_name, aid), daemon=True).start()
+            return
+
+    # "andere Aufgabe: ..." → neue Session eroeffnen
+    m = NEUE_RE.search(low)
+    if m:
+        after = merged_text[m.end():].strip().lstrip(":- ").strip()
+        title = after.splitlines()[0][:50] if after else "Neue Aufgabe"
+        aid = _open_aufgabe(title)
+        _post_text(f"📋 **A{aid}** eroeffnet — _{title}_")
+        if after:
+            merged_post["message"] = after
+            threading.Thread(target=_run_task, args=(merged_post, sender_name, aid), daemon=True).start()
+        return
+
+    # Normal: zu aktueller Aufgabe — nur beim allerersten Mal auto-anlegen
+    with _aufgaben_lock:
+        aid = _cur_aufgabe[0]
+    if aid is None:
+        title = merged_text.splitlines()[0][:50] if merged_text else "Aufgabe"
+        aid = _open_aufgabe(title)
+    threading.Thread(target=_run_task, args=(merged_post, sender_name, aid), daemon=True).start()
 
 
 async def event_handler(message):

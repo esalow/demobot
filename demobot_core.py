@@ -199,6 +199,7 @@ def run_stream(channel, user_text, incoming_files=None, on_progress=None, on_sta
     _outbox = outbox_dir or os.path.join(d, "_outbox")
     os.makedirs(_inbox, exist_ok=True)
     os.makedirs(_outbox, exist_ok=True)
+    os.makedirs(d, exist_ok=True)
     incoming_files = incoming_files or []
     prompt = (user_text or "").strip()
     if incoming_files:

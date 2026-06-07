@@ -1,6 +1,7 @@
 {
-  "name": "umsatz_grizzly",
-  "type": "projekt",
-  "dir": "C:\\projekte\\umsatz_grizzly",
-  "task_seq": 4
+  "name": "demobot",
+  "type": "kanal",
+  "dir": "C:\\projekte\\demobot",
+  "last_activity": "2026-06-07T17:09:48+00:00",
+  "task_seq": 3
 }
