@@ -54,7 +54,7 @@ class _SSLClientShim:
 
 _mmws.ssl = _SSLClientShim()
 
-load_dotenv()
+load_dotenv(dotenv_path=os.path.join(os.getcwd(), ".env"), override=True)
 
 import demobot_core as core
 
