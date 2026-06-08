@@ -10,6 +10,7 @@ demobot_core.py — claude CLI Engine (frontend-agnostisch).
 """
 
 import os
+import re
 import json
 import shutil
 import socket
@@ -27,6 +28,9 @@ TIMEOUT = int(os.environ.get("DEMOBOT_TIMEOUT", "240"))
 VORGANG_BASE = os.environ.get("DEMOBOT_VORGANG_BASE",
     r"G:\Meine Ablage\ESALOW-Archiv\_vorgaenge")
 CLAUDE_META = os.environ.get("DEMOBOT_CLAUDE_META", r"C:\projekte\claude-meta")
+# Ab dieser Transkript-Groesse (Bytes) wird die Session vorbeugend frisch gestartet
+# (mit Kurz-Kontext aus dialog.jsonl), bevor sie ins Kontext-Limit laeuft. Tunebar.
+CTX_LIMIT_BYTES = int(os.environ.get("DEMOBOT_CTX_LIMIT_BYTES", str(2_000_000)))
 
 APPEND_SYSTEM = (
     "KONTEXT: Du wirst per Mattermost gesteuert. Nachrichten kommen oft von Sprach-"
@@ -185,31 +189,94 @@ def _collect_outbox(outbox):
             if os.path.isfile(os.path.join(outbox, f))]
 
 
-def run_stream(channel, user_text, incoming_files=None, on_progress=None, on_start=None,
-               extra_append="", work_dir=None, inbox_dir=None, outbox_dir=None):
-    """Fuehrt claude LIVE aus. on_progress(text) je Schritt, on_start(proc) sobald
-    der Prozess laeuft (fuer stop). extra_append = zusaetzlicher System-Prompt-Hinweis.
-    work_dir überschreibt das Arbeitsverzeichnis (für Projekt-Routing).
-    inbox_dir/outbox_dir überschreiben die Datei-Pfade im System-Prompt.
-    Gibt (reply_text, outbox_files) zurueck."""
-    d = work_dir or dir_for(channel)
-    if not os.path.isdir(d):
-        return (f"Verzeichnis existiert nicht: {d}", [])
-    _inbox = inbox_dir or os.path.join(d, "_inbox")
-    _outbox = outbox_dir or os.path.join(d, "_outbox")
-    os.makedirs(_inbox, exist_ok=True)
-    os.makedirs(_outbox, exist_ok=True)
-    os.makedirs(d, exist_ok=True)
-    incoming_files = incoming_files or []
-    prompt = (user_text or "").strip()
-    if incoming_files:
-        prompt += ("\n\n[System: Uploads in " + _inbox + ": "
-                   + ", ".join(os.path.basename(p) for p in incoming_files) + "]")
-    if not prompt:
-        return ("", [])
+def _proj_slug(d):
+    """Claude legt Transkripte unter ~/.claude/projects/<slug>/<sid>.jsonl ab.
+    slug = Pfad, alle Nicht-Alphanumerischen Zeichen -> '-' (z.B.
+    'C:\\projekte\\demobot' -> 'C--projekte-demobot')."""
+    return re.sub(r"[^a-zA-Z0-9]", "-", d)
 
+
+def _transcript_path(d, sid):
+    return os.path.join(os.path.expanduser("~"), ".claude", "projects",
+                        _proj_slug(d), f"{sid}.jsonl")
+
+
+def _session_size(d, sid):
+    """Groesse des Session-Transkripts in Bytes (0 wenn nicht vorhanden)."""
+    if not sid:
+        return 0
+    try:
+        return os.path.getsize(_transcript_path(d, sid))
+    except Exception:
+        return 0
+
+
+def _aufg_suffix(channel):
+    """'demobot_A1' -> 'A1'; 'demobot' -> None. Zum Filtern von dialog.jsonl."""
+    return channel.split("_", 1)[1] if "_" in channel else None
+
+
+_TOO_LONG_MARKERS = ("prompt is too long", "prompt too long", "input is too long",
+                     "context length", "context window", "context limit",
+                     "too many tokens")
+
+
+def _looks_too_long(reply):
+    r = (reply or "").lower()
+    return any(m in r for m in _TOO_LONG_MARKERS)
+
+
+def _recent_context(d, channel, limit=12, maxlen=1600):
+    """Kurzer Gespraechs-Kontext aus logs/dialog.jsonl (fuer Reseed nach Reset).
+    Gefiltert nach Aufgaben-ID des Kanals, damit Threads nicht vermischt werden."""
+    f = os.path.join(d, "logs", "dialog.jsonl")
+    if not os.path.exists(f):
+        return ""
+    suf = _aufg_suffix(channel)
+    rows = []
+    try:
+        with open(f, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except Exception:
+                    continue
+                if (e.get("aufgabe_id") or None) != suf:
+                    continue
+                rows.append(e)
+    except Exception:
+        return ""
+    parts = []
+    for e in rows[-limit:]:
+        q = " ".join((e.get("in") or "").split())
+        a = " ".join((e.get("out") or "").split())
+        if not (q or a):
+            continue
+        parts.append(f"- F: {q[:110]} | A: {a[:110]}")
+    return "\n".join(parts)[:maxlen]
+
+
+def _reseed_prefix(d, channel):
+    """Baut den Kurz-Kontext-Block, der nach einem Session-Reset vorangestellt wird."""
+    ctx = _recent_context(d, channel)
+    if not ctx:
+        return ("[System: Die vorherige Session wurde wegen Laenge zurueckgesetzt. "
+                "Kein Kurzprotokoll verfuegbar — frage bei Bedarf nach Kontext.]")
+    return ("[System: Die vorherige Session wurde wegen Laenge zurueckgesetzt "
+            "(Kontext-Limit). Letzte Punkte aus dem Gespraech als Kurz-Kontext:\n"
+            + ctx +
+            "\nKnuepfe daran an; frage nach falls Details fehlen.]")
+
+
+def _run_once(channel, d, prompt, on_progress, on_start, extra_append,
+              inbox_dir, outbox_dir):
+    """Ein einzelner claude-Lauf (Streaming). Speichert die neue Session-ID.
+    Gibt (reply_text, outbox_files) zurueck."""
     cmd = _build_cmd(channel, d, stream=True, extra_append=extra_append,
-                     inbox_dir=_inbox, outbox_dir=_outbox)
+                     inbox_dir=inbox_dir, outbox_dir=outbox_dir)
     # Prompt via stdin (NICHT -p): mehrzeilige Aufgaben bleiben erhalten und
     # umgehen den Batch-Wrapper-Bug (Newline im Argument -> Plaintext).
     proc = subprocess.Popen(cmd, cwd=d, stdin=subprocess.PIPE,
@@ -273,7 +340,72 @@ def run_stream(channel, user_text, incoming_files=None, on_progress=None, on_sta
 
     if new_sid:
         _save_session(d, channel, new_sid)
-    return (reply or "(fertig, keine Textantwort)", _collect_outbox(_outbox))
+    return (reply, _collect_outbox(outbox_dir))
+
+
+def run_stream(channel, user_text, incoming_files=None, on_progress=None, on_start=None,
+               on_notice=None, extra_append="", work_dir=None, inbox_dir=None, outbox_dir=None):
+    """Fuehrt claude LIVE aus. on_progress(text) je Schritt, on_start(proc) sobald
+    der Prozess laeuft (fuer stop). extra_append = zusaetzlicher System-Prompt-Hinweis.
+    work_dir überschreibt das Arbeitsverzeichnis (für Projekt-Routing).
+    inbox_dir/outbox_dir überschreiben die Datei-Pfade im System-Prompt.
+
+    Kontext-Management:
+    - Schicht 1 (vorbeugend): ist das Session-Transkript > CTX_LIMIT_BYTES, wird die
+      Session frisch gestartet und ein Kurz-Kontext aus dialog.jsonl vorangestellt.
+    - Schicht 2 (Notfall): meldet ein Resume-Lauf 'prompt too long', wird die Session
+      zurueckgesetzt, ein Kurz-Kontext vorangestellt und EINMAL neu versucht.
+    Gibt (reply_text, outbox_files) zurueck."""
+    d = work_dir or dir_for(channel)
+    if not os.path.isdir(d):
+        return (f"Verzeichnis existiert nicht: {d}", [])
+    _inbox = inbox_dir or os.path.join(d, "_inbox")
+    _outbox = outbox_dir or os.path.join(d, "_outbox")
+    os.makedirs(_inbox, exist_ok=True)
+    os.makedirs(_outbox, exist_ok=True)
+    os.makedirs(d, exist_ok=True)
+    incoming_files = incoming_files or []
+    prompt = (user_text or "").strip()
+    if incoming_files:
+        prompt += ("\n\n[System: Uploads in " + _inbox + ": "
+                   + ", ".join(os.path.basename(p) for p in incoming_files) + "]")
+    if not prompt:
+        return ("", [])
+
+    def _say(msg):
+        # on_progress = transiente Live-Zeile, on_notice = permanente Kanal-Meldung
+        for cb in (on_progress, on_notice):
+            if cb:
+                try:
+                    cb(msg)
+                except Exception:
+                    pass
+
+    sid = _load_session(d, channel)
+    resuming = bool(sid)
+
+    # Schicht 1 (vorbeugend): zu grosses Transkript -> frisch starten mit Reseed
+    sz = _session_size(d, sid)
+    if sid and sz > CTX_LIMIT_BYTES:
+        _say(f"♻️ Session war gross ({sz/1_000_000:.1f} MB) — frisch gestartet "
+             f"mit Kurz-Kontext aus dem Verlauf.")
+        _save_session(d, channel, None)
+        prompt = _reseed_prefix(d, channel) + "\n\n---\n\n" + prompt
+        resuming = False
+
+    reply, outfiles = _run_once(channel, d, prompt, on_progress, on_start,
+                                extra_append, _inbox, _outbox)
+
+    # Schicht 2 (Notfall): Resume trotzdem ins Limit gelaufen -> Reset + Reseed + 1x Retry
+    if resuming and _looks_too_long(reply):
+        _say("♻️ Kontext-Limit erreicht — Session zurueckgesetzt, Kurz-Kontext "
+             "uebernommen, neuer Versuch.")
+        _save_session(d, channel, None)
+        retry_prompt = _reseed_prefix(d, channel) + "\n\n---\n\n" + prompt
+        reply, outfiles = _run_once(channel, d, retry_prompt, on_progress, on_start,
+                                    extra_append, _inbox, _outbox)
+
+    return (reply or "(fertig, keine Textantwort)", outfiles)
 
 
 def archive_sent(channel, pfade):

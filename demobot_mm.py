@@ -67,6 +67,7 @@ MM_CHANNEL_ID = os.environ["MM_CHANNEL_ID_DEMOBOT"]
 MM_SCHEME = os.environ.get("MM_SCHEME", "https")
 MM_PORT = int(os.environ.get("MM_PORT", "443"))
 MM_OWNER = os.environ.get("MM_OWNER_USER_ID", "")
+MM_DM_CHANNEL_ID = os.environ.get("MM_DM_CHANNEL_ID", "")
 CHANNEL_NAME = os.environ.get("DEMOBOT_CHANNEL_NAME", "demobot")
 MAX_PARALLEL = int(os.environ.get("DEMOBOT_MAX_PARALLEL", "5"))
 AUFGABEN_MAX = int(os.environ.get("DEMOBOT_MAX_AUFGABEN", "2"))
@@ -75,6 +76,19 @@ SESSION_TTL = int(os.environ.get("DEMOBOT_SESSION_TTL", str(2 * 3600)))  # Defau
 API_BASE = f"{MM_SCHEME}://{MM_URL}/api/v4"
 AUTH_H = {"Authorization": "Bearer " + MM_TOKEN}
 DEMOBOT_DIR = core.dir_for(CHANNEL_NAME)
+
+_channel_type_cache = {}  # channel_id -> 'O'/'P'/'D'/'G'
+
+def _get_channel_type(channel_id):
+    if channel_id in _channel_type_cache:
+        return _channel_type_cache[channel_id]
+    try:
+        r = requests.get(f"{API_BASE}/channels/{channel_id}", headers=AUTH_H, timeout=10)
+        ctype = r.json().get("type", "O")
+    except Exception:
+        ctype = "O"
+    _channel_type_cache[channel_id] = ctype
+    return ctype
 INBOX = os.path.join(DEMOBOT_DIR, "_inbox")
 OUTBOX = os.path.join(DEMOBOT_DIR, "_outbox")
 DIALOG_LOG = os.path.join(DEMOBOT_DIR, "logs", "dialog.jsonl")
@@ -285,14 +299,16 @@ def _make_driver():
                    "port": MM_PORT, "verify": True, "timeout": 30})
 
 
-def _post_text(text):
+def _post_text(text, channel_id=None):
+    cid = channel_id or MM_CHANNEL_ID
     text = text or "(leer)"
     for i in range(0, len(text), 16000):
-        driver.posts.create_post({"channel_id": MM_CHANNEL_ID, "message": text[i:i + 16000]})
+        driver.posts.create_post({"channel_id": cid, "message": text[i:i + 16000]})
 
 
-def _create_post(msg):
-    return driver.posts.create_post({"channel_id": MM_CHANNEL_ID, "message": msg})
+def _create_post(msg, channel_id=None):
+    cid = channel_id or MM_CHANNEL_ID
+    return driver.posts.create_post({"channel_id": cid, "message": msg})
 
 
 def _patch(post_id, msg):
@@ -334,14 +350,15 @@ def _download_incoming(post):
     return pfade
 
 
-def _post_file(path):
+def _post_file(path, channel_id=None):
+    cid = channel_id or MM_CHANNEL_ID
     with open(path, "rb") as f:
         r = requests.post(f"{API_BASE}/files", headers=AUTH_H,
-                          data={"channel_id": MM_CHANNEL_ID},
+                          data={"channel_id": cid},
                           files={"files": (os.path.basename(path), f)}, timeout=180)
     r.raise_for_status()
     fid = r.json()["file_infos"][0]["id"]
-    driver.posts.create_post({"channel_id": MM_CHANNEL_ID, "message": "", "file_ids": [fid]})
+    driver.posts.create_post({"channel_id": cid, "message": "", "file_ids": [fid]})
 
 
 def _next_tid():
@@ -426,7 +443,7 @@ def _stop(tid):
     return f"⏹️ #{tid} wird abgebrochen."
 
 
-def _process(text, files, sender="user", aufgabe_id=None):
+def _process(text, files, sender="user", aufgabe_id=None, reply_channel_id=None):
     active = _get_active()
     work_dir = active["dir"]
     tid = _next_tid()
@@ -434,7 +451,7 @@ def _process(text, files, sender="user", aufgabe_id=None):
     proj_label = "" if active["name"] == CHANNEL_NAME else f" [{active['name']}]"
     aufgabe_label = f" [A{aufgabe_id}]" if aufgabe_id else ""
     title = (text.splitlines()[0][:55] if text else ("Datei-Aufgabe" if files else "Aufgabe"))
-    post = _create_post(f"▶️ **#{tid}**{proj_label}{aufgabe_label} läuft … _{title}_")
+    post = _create_post(f"▶️ **#{tid}**{proj_label}{aufgabe_label} läuft … _{title}_", reply_channel_id)
     tk = {"id": tid, "title": title, "status": "läuft", "proc": None,
           "post_id": post["id"], "steps": [], "last": 0.0,
           "aufgabe_id": aufgabe_id}
@@ -457,6 +474,7 @@ def _process(text, files, sender="user", aufgabe_id=None):
             reply, outfiles = core.run_stream(
                 session_key, text, files,
                 on_progress=on_progress, on_start=on_start,
+                on_notice=lambda m: _post_text(m, reply_channel_id),
                 work_dir=work_dir, inbox_dir=INBOX, outbox_dir=OUTBOX)
             if tk["status"] == "abgebrochen":
                 _patch(tk["post_id"], f"⏹️ **#{tid}** abgebrochen — _{title}_")
@@ -470,15 +488,15 @@ def _process(text, files, sender="user", aufgabe_id=None):
                 if len(parts) == 3:
                     sw_typ, sw_name = parts[1], parts[2].strip()
                     if sw_typ == "projekt":
-                        _post_text(_cmd_projekt(sw_name))
+                        _post_text(_cmd_projekt(sw_name), reply_channel_id)
                     elif sw_typ == "vorgang":
-                        _post_text(_cmd_vorgang(sw_name))
+                        _post_text(_cmd_vorgang(sw_name), reply_channel_id)
                 reply = "\n".join(reply_lines[1:]).strip()
             _patch(tk["post_id"], f"✅ **#{tid}**{proj_label}{aufgabe_label} — _{title}_\n\n{(reply or '')[:15000]}")
             sent = []
             for p in outfiles:
                 try:
-                    _post_file(p)
+                    _post_file(p, reply_channel_id)
                     sent.append(p)
                     log.info("Datei gesendet: %s", os.path.basename(p))
                 except Exception:
@@ -536,7 +554,7 @@ def _cmd_zurueck():
     return f"↩️ Zurück zu **{CHANNEL_NAME}** (Kanal-Standard)"
 
 
-def _handle_post(post, sender_name, aufgabe_id=None):
+def _handle_post(post, sender_name, aufgabe_id=None, reply_channel_id=None):
     user_id = post.get("user_id", "")
     if MM_OWNER and user_id != MM_OWNER:
         return
@@ -548,35 +566,35 @@ def _handle_post(post, sender_name, aufgabe_id=None):
     # Projekt wechseln — NUR mit führendem /  (ohne Slash = normaler Chat)
     m = re.match(r"^/projekt\s+(.+)", low_c)
     if m:
-        _post_text(_cmd_projekt(m.group(1).strip()))
+        _post_text(_cmd_projekt(m.group(1).strip()), reply_channel_id)
         return
     if low_c in {"/projekt", "/project"}:
-        _post_text(_cmd_projekt(""))
+        _post_text(_cmd_projekt(""), reply_channel_id)
         return
 
     # Vorgang wechseln — NUR mit /
     m = re.match(r"^/vorgang\s+(.+)", low_c)
     if m:
-        _post_text(_cmd_vorgang(m.group(1).strip()))
+        _post_text(_cmd_vorgang(m.group(1).strip()), reply_channel_id)
         return
     if low_c in {"/vorgang"}:
-        _post_text(_cmd_vorgang(""))
+        _post_text(_cmd_vorgang(""), reply_channel_id)
         return
 
     # Zurück zu demobot
     if low_c in {"/zurück", "/zurueck", "/home"}:
-        _post_text(_cmd_zurueck())
+        _post_text(_cmd_zurueck(), reply_channel_id)
         return
 
     # Status
     if low_c in STATUS_WORDS or low in STATUS_WORDS:
-        _post_text(_list_tasks())
+        _post_text(_list_tasks(), reply_channel_id)
         return
 
     # Stop
     m = re.match(r"(?:stop|unterbrich|abbrechen|abbruch|halt)\s*#?(\d+)", low)
     if m:
-        _post_text(_stop(int(m.group(1))))
+        _post_text(_stop(int(m.group(1))), reply_channel_id)
         return
 
     if not text and not incoming:
@@ -587,12 +605,12 @@ def _handle_post(post, sender_name, aufgabe_id=None):
     active = _get_active()
     log.info("[demobot:%s] %s: %s %s", active["name"], sender_name, text,
              f"[+{len(incoming)} Datei]" if incoming else "")
-    _process(text, incoming, sender=sender_name, aufgabe_id=aufgabe_id)
+    _process(text, incoming, sender=sender_name, aufgabe_id=aufgabe_id, reply_channel_id=reply_channel_id)
 
 
-def _run_task(post, sender, aufgabe_id=None):
+def _run_task(post, sender, aufgabe_id=None, reply_channel_id=None):
     try:
-        _handle_post(post, sender, aufgabe_id=aufgabe_id)
+        _handle_post(post, sender, aufgabe_id=aufgabe_id, reply_channel_id=reply_channel_id)
     except Exception:
         log.exception("Fehler bei der Verarbeitung")
 
@@ -611,6 +629,7 @@ def _flush_debounce(user_id):
         return
     posts = buf["posts"]
     sender_name = buf["sender_name"]
+    rcid = buf.get("reply_channel_id")  # None → Hauptkanal
     texts = [p.get("message", "").strip() for p in posts if p.get("message", "").strip()]
     merged_text = "\n".join(texts)
     all_file_ids = []
@@ -631,11 +650,11 @@ def _flush_debounce(user_id):
         with _aufgaben_lock:
             hat_aufgaben = bool(_aufgaben)
         if hat_aufgaben:
-            _post_text(_aufgaben_liste())
+            _post_text(_aufgaben_liste(), rcid)
             _await_select[0] = True
             return
         # keine Aufgaben → normal verarbeiten
-        threading.Thread(target=_run_task, args=(merged_post, sender_name), daemon=True).start()
+        threading.Thread(target=_run_task, args=(merged_post, sender_name), kwargs={"reply_channel_id": rcid}, daemon=True).start()
         return
 
     # Auswahl-Modus nach "zurueck": "1" oder "A2" → zu Aufgabe wechseln
@@ -647,7 +666,7 @@ def _flush_debounce(user_id):
                 if aid in _aufgaben:
                     _cur_aufgabe[0] = aid
                     _await_select[0] = False
-                    _post_text(f"↩️ Weiter mit **A{aid}** — {_aufgaben[aid]['title']}")
+                    _post_text(f"↩️ Weiter mit **A{aid}** — {_aufgaben[aid]['title']}", rcid)
                     return
         _await_select[0] = False
 
@@ -663,7 +682,7 @@ def _flush_debounce(user_id):
             if has:
                 _cur_aufgabe[0] = aid
                 _await_select[0] = False
-                threading.Thread(target=_run_task, args=(merged_post, sender_name, aid), daemon=True).start()
+                threading.Thread(target=_run_task, args=(merged_post, sender_name, aid), kwargs={"reply_channel_id": rcid}, daemon=True).start()
                 return
     if m:
         aid = int(m.group(1))
@@ -676,10 +695,10 @@ def _flush_debounce(user_id):
             if not rest:
                 with _aufgaben_lock:
                     title = _aufgaben[aid]["title"]
-                _post_text(f"↩️ Weiter mit **A{aid}** — {title}")
+                _post_text(f"↩️ Weiter mit **A{aid}** — {title}", rcid)
                 return
             merged_post["message"] = rest
-            threading.Thread(target=_run_task, args=(merged_post, sender_name, aid), daemon=True).start()
+            threading.Thread(target=_run_task, args=(merged_post, sender_name, aid), kwargs={"reply_channel_id": rcid}, daemon=True).start()
             return
 
     # "andere Aufgabe: ..." → neue Session eroeffnen
@@ -688,10 +707,10 @@ def _flush_debounce(user_id):
         after = merged_text[m.end():].strip().lstrip(":- ").strip()
         title = after.splitlines()[0][:50] if after else "Neue Aufgabe"
         aid = _open_aufgabe(title)
-        _post_text(f"📋 **A{aid}** eroeffnet — _{title}_")
+        _post_text(f"📋 **A{aid}** eroeffnet — _{title}_", rcid)
         if after:
             merged_post["message"] = after
-            threading.Thread(target=_run_task, args=(merged_post, sender_name, aid), daemon=True).start()
+            threading.Thread(target=_run_task, args=(merged_post, sender_name, aid), kwargs={"reply_channel_id": rcid}, daemon=True).start()
         return
 
     # Normal: zu aktueller Aufgabe — nur beim allerersten Mal auto-anlegen
@@ -700,7 +719,7 @@ def _flush_debounce(user_id):
     if aid is None:
         title = merged_text.splitlines()[0][:50] if merged_text else "Aufgabe"
         aid = _open_aufgabe(title)
-    threading.Thread(target=_run_task, args=(merged_post, sender_name, aid), daemon=True).start()
+    threading.Thread(target=_run_task, args=(merged_post, sender_name, aid), kwargs={"reply_channel_id": rcid}, daemon=True).start()
 
 
 async def event_handler(message):
@@ -714,22 +733,34 @@ async def event_handler(message):
         post = json.loads(data["data"]["post"])
     except Exception:
         return
-    if post.get("channel_id") != MM_CHANNEL_ID:
-        return
-    if post.get("user_id") == BOT_USER_ID:
+    channel_id = post.get("channel_id", "")
+    user_id = post.get("user_id", "")
+
+    # Hauptkanal oder DM-Kanal vom Owner
+    if channel_id == MM_CHANNEL_ID:
+        reply_channel_id = None  # Default → Hauptkanal
+    else:
+        if MM_OWNER and user_id != MM_OWNER:
+            return
+        if _get_channel_type(channel_id) != "D":
+            return
+        reply_channel_id = channel_id
+        log.info("[demobot] DM von %s in Kanal %s", user_id, channel_id)
+
+    if user_id == BOT_USER_ID:
         return
     # System-Meldungen (join/leave/add/header…) ignorieren — kein Input
     if (post.get("type") or "").startswith("system_"):
         return
     sender_name = (data["data"].get("sender_name") or "").lstrip("@") or "user"
-    user_id = post.get("user_id", sender_name)
     with _debounce_lock:
         if user_id in _debounce_buffers:
             # Timer zurücksetzen, Nachricht anhängen
             _debounce_buffers[user_id]["timer"].cancel()
             _debounce_buffers[user_id]["posts"].append(post)
         else:
-            _debounce_buffers[user_id] = {"posts": [post], "sender_name": sender_name}
+            _debounce_buffers[user_id] = {"posts": [post], "sender_name": sender_name,
+                                           "reply_channel_id": reply_channel_id}
         t = threading.Timer(DEBOUNCE_SECONDS, _flush_debounce, args=(user_id,))
         _debounce_buffers[user_id]["timer"] = t
         t.daemon = True

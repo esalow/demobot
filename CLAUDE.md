@@ -51,3 +51,20 @@ Der Worker holt den Job, führt ihn aus und postet das Ergebnis selbst in den Ka
 - Antworte **kurz** und auf **Deutsch** (echte Umlaute ä ö ü ß).
 - Sag knapp, was du getan hast. Keine langen Erklärungen.
 - Wenn du eine Datei nach `_outbox\` gelegt hast, erwähne das kurz („Excel liegt im Chat").
+
+## Architektur & Betrieb (Kurz)
+
+> Details: `docs/WP_*.md`.
+
+- **3 Instanzen, EIN Code:** `start_all.ps1` startet `demobot`, `demobot2`, `demobot3`
+  mit demselben Script `demobot_mm.py` (nur anderes Arbeitsverzeichnis + eigene `.env`).
+  demobot2/3 haben **keine eigenen .py-Dateien** → sie importieren `demobot_core.py`
+  aus `c:\projekte\demobot`. **Ein Fix in demobot/ gilt für alle drei.**
+- **Sessions:** Claude-CLI via `--resume`, Session-ID pro Kanal/Aufgabe in
+  `.sessions.json`. Transkripte: `~/.claude/projects/<slug>/<sid>.jsonl`.
+- **Kontext-Schutz:** TTL-Reset (Inaktivität, Haupt-Kanal) **+** Auto-Recover bei zu
+  großer Session (`demobot_core.run_stream`, Schwelle `DEMOBOT_CTX_LIMIT_BYTES`,
+  Default 2 MB) → Reset + Kurz-Kontext aus `dialog.jsonl`, sichtbare `♻️`-Meldung.
+- **Aufgaben/"Boxen" (A1, A2, …):** virtuelle Threads pro Kanal mit eigener Session;
+  Routing aktuell über **einen** globalen `_cur_aufgabe` (Umbau auf echte Parallel-
+  Aufgaben offen — siehe `docs/`).
