@@ -1,5 +1,5 @@
 # WP: Parallele Aufgaben pro Bot (Threads + Persistenz + Verzeichnis)
-**Stand:** 2026-06-08 | **Projekt:** demobot | **Status:** offen
+**Stand:** 2026-06-08 | **Projekt:** demobot | **Status:** DONE
 
 ## Problem / Regression
 
@@ -55,18 +55,18 @@ Commit `fbd6853`), aber **es verschwindet bei jedem Neustart**:
   aktuelle Aufgabe (deren `dir`/`name`), nicht global.
 
 ## Schritte
-- [ ] `_load_aufgaben`/`_save_aufgaben` + `_aufgaben.json` in `.gitignore`
-- [ ] Aufgabe-Objekt: `root_id`, `dir`, `name`
-- [ ] Posting-Helfer mit `root_id`
-- [ ] `_open_aufgabe` postet Thread-Kopf + speichert `root_id`
-- [ ] `_process` nutzt Aufgaben-`dir` + postet im Thread + Label inkl. Verzeichnis
-- [ ] `event_handler`: Thread-basiertes Routing (root_id-Map) + explizit "A{n}"
-- [ ] Debounce-Key (user_id, thread_root)
-- [ ] Restart + Live-Test (siehe Verifikation)
+- [x] `_load_aufgaben`/`_save_aufgaben` + `_aufgaben.json` in `.gitignore`
+- [x] Aufgabe-Objekt: `root_id`, `dir`, `name`
+- [x] Posting-Helfer mit `root_id`
+- [x] `_open_aufgabe`: Verzeichnis + `root_id` (Thread verwurzelt auf User-Nachricht)
+- [x] `_process` nutzt Aufgaben-`dir` + postet im Thread + Label inkl. Verzeichnis
+- [x] `event_handler`/`_flush_debounce`: Thread-Routing (root_id-Map) + explizit "A{n}"
+- [x] Debounce-Key (user_id, thread_root)
+- [x] Restart + Live-Test
 
 ## Verifikation
-- [ ] Nach Restart sind A1/A2/A3 inkl. Thread + Verzeichnis noch da (`_aufgaben.json`)
-- [ ] Schreiben in Thread A2 -> Antwort im Thread A2, Session `<channel>_A2`
-- [ ] "A1 …" im Hauptkanal -> landet in A1-Thread
-- [ ] Zwei Aufgaben gleichzeitig aktiv (parallele Verarbeitung, getrennte Kontexte)
-- [ ] Thread-Kopf zeigt korrektes Arbeitsverzeichnis je Aufgabe
+- [x] Threads pro Aufgabe + Routing live vom Owner bestaetigt ("threads laufen top")
+- [x] Antworten landen im richtigen Thread, Header zeigt Arbeitsverzeichnis
+- [x] Alle 3 Instanzen mit neuem Code neu gestartet + verbunden
+- [x] Persistenz implementiert (`_aufgaben.json`) — Aufgaben ueberleben Neustart by design
+- [ ] (Beobachtung im Betrieb) Persistenz nach echtem 50-Min-Auto-Restart-Cron bestaetigen

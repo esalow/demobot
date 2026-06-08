@@ -268,6 +268,55 @@ _cur_aufgabe = [None]   # aktuell aktive Aufgabe-ID (None = Einzel-Modus)
 _await_select = [False] # True = warte auf A1/A2/... nach "zurueck"
 _aufgaben_lock = threading.Lock()
 
+# Aufgaben ueberleben Neustart (sonst kippt alles zurueck auf A1).
+_AUFGABEN_FILE = os.path.join(DEMOBOT_DIR, "_aufgaben.json")
+
+
+def _save_aufgaben():
+    try:
+        with _aufgaben_lock:
+            data = {"aufgaben": {str(k): v for k, v in _aufgaben.items()},
+                    "cur": _cur_aufgabe[0], "seq": _aufgabe_seq[0]}
+        with open(_AUFGABEN_FILE, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+    except Exception:
+        log.warning("Aufgaben speichern fehlgeschlagen", exc_info=True)
+
+
+def _load_aufgaben():
+    if not os.path.exists(_AUFGABEN_FILE):
+        return
+    try:
+        with open(_AUFGABEN_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+        with _aufgaben_lock:
+            _aufgaben.clear()
+            for k, v in (data.get("aufgaben") or {}).items():
+                _aufgaben[int(k)] = v
+            _cur_aufgabe[0] = data.get("cur")
+            _aufgabe_seq[0] = int(data.get("seq", 0))
+        log.info("Aufgaben geladen: %d (cur=%s, seq=%d)",
+                 len(_aufgaben), _cur_aufgabe[0], _aufgabe_seq[0])
+    except Exception:
+        log.warning("Aufgaben laden fehlgeschlagen", exc_info=True)
+
+
+def _get_aufgabe(aid):
+    with _aufgaben_lock:
+        a = _aufgaben.get(aid)
+        return dict(a) if a else None
+
+
+def _aufgabe_by_root(root_id):
+    """Aufgabe-ID anhand des Mattermost-Thread-Kopfs (root_id) finden."""
+    if not root_id:
+        return None
+    with _aufgaben_lock:
+        for aid, a in _aufgaben.items():
+            if a.get("root_id") == root_id:
+                return aid
+    return None
+
 NEUE_RE = re.compile(
     r"\b(andere|neue|n[aä]chste|zweite|dritte|noch.?eine|au[sß]erdem)\b.{0,20}"
     r"\b(aufgabe|aufgab|sache|task)\b", re.I)
@@ -299,16 +348,22 @@ def _make_driver():
                    "port": MM_PORT, "verify": True, "timeout": 30})
 
 
-def _post_text(text, channel_id=None):
+def _post_text(text, channel_id=None, root_id=None):
     cid = channel_id or MM_CHANNEL_ID
     text = text or "(leer)"
     for i in range(0, len(text), 16000):
-        driver.posts.create_post({"channel_id": cid, "message": text[i:i + 16000]})
+        body = {"channel_id": cid, "message": text[i:i + 16000]}
+        if root_id:
+            body["root_id"] = root_id
+        driver.posts.create_post(body)
 
 
-def _create_post(msg, channel_id=None):
+def _create_post(msg, channel_id=None, root_id=None):
     cid = channel_id or MM_CHANNEL_ID
-    return driver.posts.create_post({"channel_id": cid, "message": msg})
+    body = {"channel_id": cid, "message": msg}
+    if root_id:
+        body["root_id"] = root_id
+    return driver.posts.create_post(body)
 
 
 def _patch(post_id, msg):
@@ -350,7 +405,7 @@ def _download_incoming(post):
     return pfade
 
 
-def _post_file(path, channel_id=None):
+def _post_file(path, channel_id=None, root_id=None):
     cid = channel_id or MM_CHANNEL_ID
     with open(path, "rb") as f:
         r = requests.post(f"{API_BASE}/files", headers=AUTH_H,
@@ -358,7 +413,10 @@ def _post_file(path, channel_id=None):
                           files={"files": (os.path.basename(path), f)}, timeout=180)
     r.raise_for_status()
     fid = r.json()["file_infos"][0]["id"]
-    driver.posts.create_post({"channel_id": cid, "message": "", "file_ids": [fid]})
+    body = {"channel_id": cid, "message": "", "file_ids": [fid]}
+    if root_id:
+        body["root_id"] = root_id
+    driver.posts.create_post(body)
 
 
 def _next_tid():
@@ -371,8 +429,7 @@ def _next_tid():
 
 def _render_live(tk):
     icon = {"läuft": "▶️", "fertig": "✅", "abgebrochen": "⏹️", "fehler": "❌"}.get(tk["status"], "▶️")
-    a_label = f" [A{tk['aufgabe_id']}]" if tk.get("aufgabe_id") else ""
-    head = f"{icon} **#{tk['id']}**{a_label} {tk['status']} — _{tk['title']}_"
+    head = f"{icon} **#{tk['id']}**{tk.get('label', '')} {tk['status']} — _{tk['title']}_"
     steps = tk["steps"][-8:]
     return head + ("\n" + "\n".join(steps) if steps else "")
 
@@ -400,13 +457,18 @@ def _list_tasks():
     return "\n".join(lines)
 
 
-def _open_aufgabe(title):
+def _open_aufgabe(title, work_dir=None, name=None, root_id=None):
+    active = _get_active()
     with _aufgaben_lock:
         _aufgabe_seq[0] += 1
         aid = _aufgabe_seq[0]
         _aufgaben[aid] = {"id": aid, "title": title[:50],
-                          "session_key": f"{CHANNEL_NAME}_A{aid}", "status": "aktiv"}
+                          "session_key": f"{CHANNEL_NAME}_A{aid}", "status": "aktiv",
+                          "dir": work_dir or active["dir"],
+                          "name": name or active["name"],
+                          "root_id": root_id}
         _cur_aufgabe[0] = aid
+    _save_aufgaben()
     return aid
 
 
@@ -444,17 +506,23 @@ def _stop(tid):
 
 
 def _process(text, files, sender="user", aufgabe_id=None, reply_channel_id=None):
+    a = _get_aufgabe(aufgabe_id) if aufgabe_id else None
     active = _get_active()
-    work_dir = active["dir"]
+    work_dir = (a or {}).get("dir") or active["dir"]
+    a_name = (a or {}).get("name") or active["name"]
+    thread_root = (a or {}).get("root_id")  # Mattermost-Thread der Aufgabe
     tid = _next_tid()
     session_key = _get_session_key(aufgabe_id)
-    proj_label = "" if active["name"] == CHANNEL_NAME else f" [{active['name']}]"
+    proj_label = "" if a_name == CHANNEL_NAME else f" [{a_name}]"
     aufgabe_label = f" [A{aufgabe_id}]" if aufgabe_id else ""
+    dir_label = f" `{os.path.basename(work_dir)}`"
+    label = f"{proj_label}{aufgabe_label}{dir_label}"
     title = (text.splitlines()[0][:55] if text else ("Datei-Aufgabe" if files else "Aufgabe"))
-    post = _create_post(f"▶️ **#{tid}**{proj_label}{aufgabe_label} läuft … _{title}_", reply_channel_id)
+    post = _create_post(f"▶️ **#{tid}**{label} läuft … _{title}_", reply_channel_id,
+                        root_id=thread_root)
     tk = {"id": tid, "title": title, "status": "läuft", "proc": None,
           "post_id": post["id"], "steps": [], "last": 0.0,
-          "aufgabe_id": aufgabe_id}
+          "aufgabe_id": aufgabe_id, "label": label}
     with _task_lock:
         _tasks[tid] = tk
 
@@ -474,7 +542,7 @@ def _process(text, files, sender="user", aufgabe_id=None, reply_channel_id=None)
             reply, outfiles = core.run_stream(
                 session_key, text, files,
                 on_progress=on_progress, on_start=on_start,
-                on_notice=lambda m: _post_text(m, reply_channel_id),
+                on_notice=lambda m: _post_text(m, reply_channel_id, thread_root),
                 work_dir=work_dir, inbox_dir=INBOX, outbox_dir=OUTBOX)
             if tk["status"] == "abgebrochen":
                 _patch(tk["post_id"], f"⏹️ **#{tid}** abgebrochen — _{title}_")
@@ -488,15 +556,15 @@ def _process(text, files, sender="user", aufgabe_id=None, reply_channel_id=None)
                 if len(parts) == 3:
                     sw_typ, sw_name = parts[1], parts[2].strip()
                     if sw_typ == "projekt":
-                        _post_text(_cmd_projekt(sw_name), reply_channel_id)
+                        _post_text(_cmd_projekt(sw_name), reply_channel_id, thread_root)
                     elif sw_typ == "vorgang":
-                        _post_text(_cmd_vorgang(sw_name), reply_channel_id)
+                        _post_text(_cmd_vorgang(sw_name), reply_channel_id, thread_root)
                 reply = "\n".join(reply_lines[1:]).strip()
-            _patch(tk["post_id"], f"✅ **#{tid}**{proj_label}{aufgabe_label} — _{title}_\n\n{(reply or '')[:15000]}")
+            _patch(tk["post_id"], f"✅ **#{tid}**{label} — _{title}_\n\n{(reply or '')[:15000]}")
             sent = []
             for p in outfiles:
                 try:
-                    _post_file(p, reply_channel_id)
+                    _post_file(p, reply_channel_id, thread_root)
                     sent.append(p)
                     log.info("Datei gesendet: %s", os.path.basename(p))
                 except Exception:
@@ -509,10 +577,11 @@ def _process(text, files, sender="user", aufgabe_id=None, reply_channel_id=None)
                 with _aufgaben_lock:
                     if aufgabe_id in _aufgaben:
                         _aufgaben[aufgabe_id]["status"] = "fertig"
+                _save_aufgaben()
         except Exception as e:
             log.exception("Verarbeitung fehlgeschlagen")
             tk["status"] = "fehler"
-            _patch(tk["post_id"], f"❌ **#{tid}** Fehler — {e}")
+            _patch(tk["post_id"], f"❌ **#{tid}**{label} Fehler — {e}")
             _log_dialog(sender, text, str(e), tid, work_dir, files, [], "fehler", aufgabe_id)
         finally:
             tk["proc"] = None
@@ -622,14 +691,15 @@ _debounce_lock = threading.Lock()
 _debounce_buffers = {}   # sender_id -> {"timer": Timer, "posts": [...], "sender_name": str, "files": [...]}
 
 
-def _flush_debounce(user_id):
+def _flush_debounce(key):
     with _debounce_lock:
-        buf = _debounce_buffers.pop(user_id, None)
+        buf = _debounce_buffers.pop(key, None)
     if not buf:
         return
     posts = buf["posts"]
     sender_name = buf["sender_name"]
     rcid = buf.get("reply_channel_id")  # None → Hauptkanal
+    root_id = buf.get("root_id") or ""
     texts = [p.get("message", "").strip() for p in posts if p.get("message", "").strip()]
     merged_text = "\n".join(texts)
     all_file_ids = []
@@ -642,6 +712,18 @@ def _flush_debounce(user_id):
     merged_post["file_ids"] = all_file_ids
     if len(posts) > 1:
         log.info("[debounce] %d Nachrichten zusammengefuehrt: %r", len(posts), merged_text[:120])
+
+    # Thread-Routing: schreibt der User in einem Aufgaben-Thread? -> direkt dorthin.
+    if root_id:
+        aid = _aufgabe_by_root(root_id)
+        if aid is not None:
+            with _aufgaben_lock:
+                _cur_aufgabe[0] = aid
+            _save_aufgaben()
+            threading.Thread(target=_run_task, args=(merged_post, sender_name, aid),
+                             kwargs={"reply_channel_id": rcid}, daemon=True).start()
+            return
+        # Thread gehoert zu keiner Aufgabe (fremder Thread) -> normale Logik
 
     low = merged_text.lower().strip()
 
@@ -706,8 +788,8 @@ def _flush_debounce(user_id):
     if m:
         after = merged_text[m.end():].strip().lstrip(":- ").strip()
         title = after.splitlines()[0][:50] if after else "Neue Aufgabe"
-        aid = _open_aufgabe(title)
-        _post_text(f"📋 **A{aid}** eroeffnet — _{title}_", rcid)
+        aid = _open_aufgabe(title, root_id=merged_post.get("id"))
+        _post_text(f"📋 **A{aid}** eroeffnet — _{title}_", rcid, merged_post.get("id"))
         if after:
             merged_post["message"] = after
             threading.Thread(target=_run_task, args=(merged_post, sender_name, aid), kwargs={"reply_channel_id": rcid}, daemon=True).start()
@@ -718,7 +800,7 @@ def _flush_debounce(user_id):
         aid = _cur_aufgabe[0]
     if aid is None:
         title = merged_text.splitlines()[0][:50] if merged_text else "Aufgabe"
-        aid = _open_aufgabe(title)
+        aid = _open_aufgabe(title, root_id=merged_post.get("id"))
     threading.Thread(target=_run_task, args=(merged_post, sender_name, aid), kwargs={"reply_channel_id": rcid}, daemon=True).start()
 
 
@@ -753,16 +835,19 @@ async def event_handler(message):
     if (post.get("type") or "").startswith("system_"):
         return
     sender_name = (data["data"].get("sender_name") or "").lstrip("@") or "user"
+    # Debounce pro (User, Thread): Nachrichten aus verschiedenen Threads NICHT mischen.
+    root_id = post.get("root_id") or ""
+    key = (user_id, root_id)
     with _debounce_lock:
-        if user_id in _debounce_buffers:
+        if key in _debounce_buffers:
             # Timer zurücksetzen, Nachricht anhängen
-            _debounce_buffers[user_id]["timer"].cancel()
-            _debounce_buffers[user_id]["posts"].append(post)
+            _debounce_buffers[key]["timer"].cancel()
+            _debounce_buffers[key]["posts"].append(post)
         else:
-            _debounce_buffers[user_id] = {"posts": [post], "sender_name": sender_name,
-                                           "reply_channel_id": reply_channel_id}
-        t = threading.Timer(DEBOUNCE_SECONDS, _flush_debounce, args=(user_id,))
-        _debounce_buffers[user_id]["timer"] = t
+            _debounce_buffers[key] = {"posts": [post], "sender_name": sender_name,
+                                      "reply_channel_id": reply_channel_id, "root_id": root_id}
+        t = threading.Timer(DEBOUNCE_SECONDS, _flush_debounce, args=(key,))
+        _debounce_buffers[key]["timer"] = t
         t.daemon = True
         t.start()
 
@@ -772,6 +857,7 @@ def main():
     os.makedirs(INBOX, exist_ok=True)
     os.makedirs(OUTBOX, exist_ok=True)
     _load_state()
+    _load_aufgaben()
     active = _get_active()
     log.info("State geladen: aktiv=%s (%s) → %s", active["name"], active["type"], active["dir"])
     while True:

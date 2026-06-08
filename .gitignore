@@ -2,6 +2,7 @@
 .env
 .sessions.json
 .sessions.json.bak
+_aufgaben.json
 __pycache__/
 *.pyc
 
