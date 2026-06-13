@@ -267,6 +267,9 @@ _ws_ping_started = [False]
 _tasks = {}
 _task_lock = threading.Lock()
 _task_seq = [0]
+_auth_lock    = threading.Lock()
+_auth_pending = False
+_auth_proc    = None
 
 # --- Multi-Aufgaben-State ---
 _aufgaben = {}          # int -> {id, title, session_key, status}
@@ -274,6 +277,7 @@ _aufgabe_seq = [0]
 _cur_aufgabe = [None]   # aktuell aktive Aufgabe-ID (None = Einzel-Modus)
 _await_select = [False] # True = warte auf A1/A2/... nach "zurueck"
 _aufgaben_lock = threading.Lock()
+_STARTUP_TS = int(time.time() * 1000)  # ms — Nachrichten vor Neustart ignorieren
 
 # Aufgaben ueberleben Neustart (sonst kippt alles zurueck auf A1).
 _AUFGABEN_FILE = os.path.join(DEMOBOT_DIR, "_aufgaben.json")
@@ -352,6 +356,142 @@ EXEC_HINT = (
 SPINNER_FRAMES = ["/", "-", "\\", "|"]
 
 
+_PID_FILE = os.path.join(DEMOBOT_DIR, ".pid")
+
+
+def _acquire_pidlock():
+    """Verhindert doppelte Prozesse. Alten Prozess per psutil beenden."""
+    if os.path.exists(_PID_FILE):
+        try:
+            old_pid = int(open(_PID_FILE).read().strip())
+            import psutil
+            try:
+                p = psutil.Process(old_pid)
+                cmd = " ".join(p.cmdline())
+                if "demobot_mm" in cmd:
+                    log.info("Alter demobot-Prozess gefunden (PID %d) — beende ihn", old_pid)
+                    p.terminate()
+                    try:
+                        p.wait(timeout=5)
+                    except Exception:
+                        p.kill()
+                    log.info("Alter Prozess beendet")
+            except Exception:
+                pass  # NoSuchProcess oder psutil nicht verfügbar
+        except Exception as e:
+            log.warning("PID-Lock prüfen fehlgeschlagen: %s", e)
+    with open(_PID_FILE, "w") as fh:
+        fh.write(str(os.getpid()))
+    import atexit
+    atexit.register(lambda: os.unlink(_PID_FILE) if os.path.exists(_PID_FILE) else None)
+    log.info("PID-Lock gesetzt: PID %d", os.getpid())
+
+
+def _extract_code(text):
+    """Extrahiert Auth-Code aus URL oder direkt als Code."""
+    import urllib.parse
+    text = text.strip()
+    if "code=" in text:
+        try:
+            params = urllib.parse.parse_qs(urllib.parse.urlparse(text).query)
+            code = params.get("code", [None])[0]
+            if code:
+                return code
+        except Exception:
+            pass
+    if len(text) > 8 and " " not in text:
+        return text
+    return None
+
+
+def _is_auth_ok():
+    """Prüft ob Claude-Token noch gültig (schneller Minimal-Call)."""
+    claude_cmd = os.environ.get("CLAUDE_CMD", "claude")
+    env = {**os.environ}
+    try:
+        r = __import__("subprocess").run(
+            [claude_cmd, "--permission-mode", "bypassPermissions",
+             "--output-format", "json", "-p", "x"],
+            capture_output=True, text=True, timeout=20, env=env)
+        out = r.stdout + r.stderr
+        return "401" not in out and "Invalid authentication" not in out
+    except Exception:
+        return False
+
+
+def _start_mm_auth():
+    """Startet `claude auth login`, liest URL, postet sie in den Kanal."""
+    global _auth_proc, _auth_pending
+    with _auth_lock:
+        if _auth_pending:
+            _post_text("⏳ Login läuft bereits — warte auf deinen Code.")
+            return
+    claude_cmd = os.environ.get("CLAUDE_CMD", "claude")
+    import subprocess as _sp
+    try:
+        proc = _sp.Popen(
+            [claude_cmd, "auth", "login"],
+            stdin=_sp.PIPE, stdout=_sp.PIPE,
+            stderr=_sp.STDOUT, text=True)
+    except Exception as e:
+        _post_text(f"❌ Auth-Start fehlgeschlagen: {e}")
+        return
+    url = None
+    try:
+        for line in iter(proc.stdout.readline, ""):
+            if "visit:" in line.lower() or "https://" in line:
+                url = line.strip().split()[-1]
+                break
+    except Exception:
+        pass
+    if not url:
+        proc.kill()
+        _post_text("❌ Login-URL konnte nicht gelesen werden — starte Bot neu.")
+        return
+    with _auth_lock:
+        _auth_proc = proc
+        _auth_pending = True
+    _post_text(
+        "🔑 **Claude-Login erforderlich**\n\n"
+        "Öffne diesen Link auf dem Handy:\n\n"
+        + url + "\n\n"
+        "Nach dem Login bekommst du einen Code — einfach hier eintippen."
+    )
+    log.info("Auth-URL in Kanal gepostet: %s", url)
+
+
+def _complete_mm_auth(code_text):
+    """Füttert den Auth-Code an den laufenden `claude auth login` Prozess."""
+    global _auth_proc, _auth_pending
+    code = _extract_code(code_text)
+    if not code:
+        _post_text("❌ Code nicht erkannt — nur den Code eingeben, kein Leerzeichen.")
+        return
+    with _auth_lock:
+        proc = _auth_proc
+    if not proc:
+        _post_text("❌ Kein Auth-Prozess aktiv — schreibe `neu einloggen` zum Neustart.")
+        return
+    try:
+        proc.stdin.write(code + "\n")
+        proc.stdin.flush()
+        proc.stdin.close()
+        ret = proc.wait(timeout=15)
+        with _auth_lock:
+            _auth_pending = False
+            _auth_proc = None
+        if ret == 0:
+            _post_text("✅ **Login erfolgreich!** Bot läuft wieder normal.")
+            log.info("Auth-Flow abgeschlossen.")
+        else:
+            _post_text(f"❌ Login fehlgeschlagen (Exit {ret}) — nochmal versuchen.")
+    except Exception as e:
+        _post_text(f"❌ Auth-Fehler: {e}")
+        with _auth_lock:
+            _auth_pending = False
+            _auth_proc = None
+
+
 def _make_driver():
     return Driver({"url": MM_URL, "token": MM_TOKEN, "scheme": MM_SCHEME,
                    "port": MM_PORT, "verify": True, "timeout": 30})
@@ -372,7 +512,23 @@ def _create_post(msg, channel_id=None, root_id=None):
     body = {"channel_id": cid, "message": msg}
     if root_id:
         body["root_id"] = root_id
-    return driver.posts.create_post(body)
+    last_exc = None
+    for attempt in range(3):
+        try:
+            return driver.posts.create_post(body)
+        except Exception as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status == 401:
+                raise  # MM-Token ungültig — nicht retrybar
+            last_exc = e
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+    if root_id:
+        try:
+            return driver.posts.create_post({"channel_id": cid, "message": msg})
+        except Exception:
+            pass
+    raise last_exc
 
 
 def _patch(post_id, msg):
@@ -610,6 +766,10 @@ def _process(text, files, sender="user", aufgabe_id=None, reply_channel_id=None)
             meta = getattr(core.run_stream, "last_meta", {})
             dauer_s = meta.get("dauer_s", round(time.time() - t_start, 1))
             session_resets = meta.get("session_resets", 0)
+            # 401 → Auth-Flow starten
+            if reply and ("401" in reply or "Invalid authentication" in reply):
+                log.warning("[%s] Claude-401 erkannt — starte MM-Auth-Flow", core.MACHINE)
+                threading.Thread(target=_start_mm_auth, daemon=True).start()
             if tk["status"] == "abgebrochen":
                 _patch(tk["post_id"], f"⏹️ **{label_num}** abgebrochen — _{title}_")
                 _log_dialog(sender, text, None, tid, work_dir, files, [], "abgebrochen", aufgabe_id,
@@ -758,8 +918,12 @@ def _handle_post(post, sender_name, aufgabe_id=None, reply_channel_id=None):
 def _run_task(post, sender, aufgabe_id=None, reply_channel_id=None):
     try:
         _handle_post(post, sender, aufgabe_id=aufgabe_id, reply_channel_id=reply_channel_id)
-    except Exception:
+    except Exception as e:
         log.exception("Fehler bei der Verarbeitung")
+        try:
+            _post_text(f"❌ Interner Fehler: {e}", reply_channel_id)
+        except Exception:
+            pass
 
 
 # Debounce: Nachrichten pro Sender sammeln, 3s warten, dann zusammenführen.
@@ -1020,6 +1184,14 @@ async def event_handler(message):
     # System-Meldungen (join/leave/add/header…) ignorieren — kein Input
     if (post.get("type") or "").startswith("system_"):
         return
+    if post.get("create_at", 0) < _STARTUP_TS:
+        return  # Nachricht von vor dem Neustart — ignorieren
+    # Auth-Flow: wenn _auth_pending → User-Eingabe als Code interpretieren
+    if _auth_pending:
+        code_candidate = (post.get("message") or "").strip()
+        if _extract_code(code_candidate):
+            threading.Thread(target=_complete_mm_auth, args=(code_candidate,), daemon=True).start()
+            return
     sender_name = (data["data"].get("sender_name") or "").lstrip("@") or "user"
     # Debounce pro (User, Thread): Nachrichten aus verschiedenen Threads NICHT mischen.
     root_id = post.get("root_id") or ""
@@ -1039,6 +1211,7 @@ async def event_handler(message):
 
 
 def main():
+    _acquire_pidlock()
     global driver, BOT_USER_ID
     os.makedirs(INBOX, exist_ok=True)
     os.makedirs(OUTBOX, exist_ok=True)
@@ -1063,6 +1236,9 @@ def main():
             log.info("Verbunden als @%s | Kanal %s -> %s | Maschine %s | Owner-only:%s",
                      me.get("username"), CHANNEL_NAME, core.dir_for(CHANNEL_NAME),
                      core.MACHINE, bool(MM_OWNER))
+            if not _is_auth_ok():
+                log.warning("Claude-Auth ungültig — starte MM-Auth-Flow")
+                threading.Thread(target=_start_mm_auth, daemon=True).start()
             _ws_last_activity[0] = time.time()  # reset bei neuer Verbindung
             driver.init_websocket(event_handler)
             log.warning("WebSocket beendet — reconnect in 5s")
