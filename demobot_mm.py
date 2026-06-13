@@ -225,12 +225,14 @@ def _register_in_registry(name, typ, directory):
 
 
 def _log_dialog(sender, user_text, reply, task_id, active_dir=None,
-                files_in=None, files_out=None, status="fertig", aufgabe_id=None):
+                files_in=None, files_out=None, status="fertig", aufgabe_id=None,
+                dauer_s=None, session_resets=None):
     os.makedirs(os.path.dirname(DIALOG_LOG), exist_ok=True)
     active_dir = active_dir or DEMOBOT_DIR
     active = _get_active()
     entry = {
         "ts": datetime.datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "machine": core.MACHINE,
         "task_id": task_id,
         "aufgabe_id": f"A{aufgabe_id}" if aufgabe_id else None,
         "sender": sender,
@@ -242,6 +244,8 @@ def _log_dialog(sender, user_text, reply, task_id, active_dir=None,
         "out": reply or "",
         "files_out": [os.path.basename(p) for p in (files_out or [])],
         "status": status,
+        "dauer_s": dauer_s,
+        "session_resets": session_resets,
     }
     with open(DIALOG_LOG, "a", encoding="utf-8", errors="replace") as fh:
         fh.write(json.dumps(entry, ensure_ascii=True) + "\n")
@@ -257,6 +261,9 @@ def _log_dialog(sender, user_text, reply, task_id, active_dir=None,
 driver = None
 BOT_USER_ID = None
 _sem = threading.Semaphore(AUFGABEN_MAX)
+_ws_last_activity = [0.0]   # Timestamp letzter WS-Message; 0 = noch nie
+_ws_watchdog_started = [False]
+_ws_ping_started = [False]
 _tasks = {}
 _task_lock = threading.Lock()
 _task_seq = [0]
@@ -308,12 +315,12 @@ def _get_aufgabe(aid):
 
 
 def _aufgabe_by_root(root_id):
-    """Aufgabe-ID anhand des Mattermost-Thread-Kopfs (root_id) finden."""
+    """Aufgabe-ID anhand Thread-Root oder Status-Post-ID finden."""
     if not root_id:
         return None
     with _aufgaben_lock:
         for aid, a in _aufgaben.items():
-            if a.get("root_id") == root_id:
+            if a.get("root_id") == root_id or a.get("main_post_id") == root_id:
                 return aid
     return None
 
@@ -341,6 +348,8 @@ EXEC_HINT = (
     "vollstaendig um — du darfst jetzt alles (Dateien, SQLite, Scripts). "
     "Ergebnis-Dateien, die der User erhalten soll, nach _outbox/ legen."
 )
+
+SPINNER_FRAMES = ["/", "-", "\\", "|"]
 
 
 def _make_driver():
@@ -429,7 +438,9 @@ def _next_tid():
 
 def _render_live(tk):
     icon = {"läuft": "▶️", "fertig": "✅", "abgebrochen": "⏹️", "fehler": "❌"}.get(tk["status"], "▶️")
-    head = f"{icon} **#{tk['id']}**{tk.get('label', '')} {tk['status']} — _{tk['title']}_"
+    spin = f" `{tk.get('spinner', '')}`" if tk["status"] == "läuft" else ""
+    num = tk.get("label_num") or f"#{tk['id']}"
+    head = f"{icon} **{num}**{tk.get('label', '')}{spin} {tk['status']} — _{tk['title']}_"
     steps = tk["steps"][-8:]
     return head + ("\n" + "\n".join(steps) if steps else "")
 
@@ -466,10 +477,45 @@ def _open_aufgabe(title, work_dir=None, name=None, root_id=None):
                           "session_key": f"{CHANNEL_NAME}_A{aid}", "status": "aktiv",
                           "dir": work_dir or active["dir"],
                           "name": name or active["name"],
-                          "root_id": root_id}
+                          "root_id": root_id,
+                          "sub_seq": 0,
+                          "main_post_id": None}
         _cur_aufgabe[0] = aid
     _save_aufgaben()
     return aid
+
+
+def _next_sub(aufgabe_id):
+    with _aufgaben_lock:
+        _aufgaben[aufgabe_id]["sub_seq"] = _aufgaben[aufgabe_id].get("sub_seq", 0) + 1
+        return _aufgaben[aufgabe_id]["sub_seq"]
+
+
+def _update_aufgaben_post(aufgabe_id, status, preview=None):
+    """Legt Hauptstrang-Post an (beim ersten Mal) oder editiert ihn."""
+    a = _get_aufgabe(aufgabe_id)
+    if not a:
+        return
+    icons = {"QUEUED": "🕐", "AKTUELL": "▶️", "DONE": "✅", "FEHLER": "❌"}
+    icon = icons.get(status, "•")
+    proj = a.get("name", CHANNEL_NAME)
+    sub = a.get("sub_seq", 0)
+    antworten = f"{sub} Antwort{'en' if sub != 1 else ''}"
+    laufend = f"läuft #{aufgabe_id}.{sub}" if status == "AKTUELL" else antworten
+    text = f"{icon} **#{aufgabe_id}** [{proj}] **{status}** — {laufend}"
+    if preview and status == "DONE":
+        kurz = preview[:120].replace("\n", " ")
+        text += f"\n   ↳ _{kurz}_"
+    with _aufgaben_lock:
+        post_id = _aufgaben.get(aufgabe_id, {}).get("main_post_id")
+    if post_id:
+        _patch(post_id, text)
+    else:
+        post = _create_post(text, MM_CHANNEL_ID)
+        with _aufgaben_lock:
+            if aufgabe_id in _aufgaben:
+                _aufgaben[aufgabe_id]["main_post_id"] = post["id"]
+        _save_aufgaben()
 
 
 def _aufgaben_liste():
@@ -514,15 +560,17 @@ def _process(text, files, sender="user", aufgabe_id=None, reply_channel_id=None)
     tid = _next_tid()
     session_key = _get_session_key(aufgabe_id)
     proj_label = "" if a_name == CHANNEL_NAME else f" [{a_name}]"
-    aufgabe_label = f" [A{aufgabe_id}]" if aufgabe_id else ""
     dir_label = f" `{os.path.basename(work_dir)}`"
-    label = f"{proj_label}{aufgabe_label}{dir_label}"
+    sub = _next_sub(aufgabe_id) if aufgabe_id else None
+    label_num = f"#{aufgabe_id}.{sub}" if aufgabe_id and sub else f"#{tid}"
+    label = f"{proj_label}{dir_label}"
     title = (text.splitlines()[0][:55] if text else ("Datei-Aufgabe" if files else "Aufgabe"))
-    post = _create_post(f"▶️ **#{tid}**{label} läuft … _{title}_", reply_channel_id,
+    post = _create_post(f"▶️ **{label_num}**{label} läuft … _{title}_", reply_channel_id,
                         root_id=thread_root)
     tk = {"id": tid, "title": title, "status": "läuft", "proc": None,
-          "post_id": post["id"], "steps": [], "last": 0.0,
-          "aufgabe_id": aufgabe_id, "label": label}
+          "post_id": post["id"],
+          "steps": [], "last": 0.0,
+          "aufgabe_id": aufgabe_id, "label": label, "label_num": label_num}
     with _task_lock:
         _tasks[tid] = tk
 
@@ -538,15 +586,34 @@ def _process(text, files, sender="user", aufgabe_id=None, reply_channel_id=None)
     with _sem:
         if tk["status"] == "abgebrochen":
             return
+        if aufgabe_id:
+            _update_aufgaben_post(aufgabe_id, "AKTUELL")
+        _spin_stop = threading.Event()
+        def _run_spinner(stop_ev=_spin_stop, t=tk):
+            i = 0
+            last_patch = 0.0
+            while not stop_ev.wait(0.5):
+                t["spinner"] = SPINNER_FRAMES[i % len(SPINNER_FRAMES)]
+                now = time.time()
+                if t["status"] == "läuft" and now - last_patch >= 1.5:
+                    _patch(t["post_id"], _render_live(t))
+                    last_patch = now
+                i += 1
+        threading.Thread(target=_run_spinner, daemon=True).start()
+        t_start = time.time()
         try:
             reply, outfiles = core.run_stream(
                 session_key, text, files,
                 on_progress=on_progress, on_start=on_start,
                 on_notice=lambda m: _post_text(m, reply_channel_id, thread_root),
                 work_dir=work_dir, inbox_dir=INBOX, outbox_dir=OUTBOX)
+            meta = getattr(core.run_stream, "last_meta", {})
+            dauer_s = meta.get("dauer_s", round(time.time() - t_start, 1))
+            session_resets = meta.get("session_resets", 0)
             if tk["status"] == "abgebrochen":
-                _patch(tk["post_id"], f"⏹️ **#{tid}** abgebrochen — _{title}_")
-                _log_dialog(sender, text, None, tid, work_dir, files, [], "abgebrochen", aufgabe_id)
+                _patch(tk["post_id"], f"⏹️ **{label_num}** abgebrochen — _{title}_")
+                _log_dialog(sender, text, None, tid, work_dir, files, [], "abgebrochen", aufgabe_id,
+                            dauer_s=dauer_s, session_resets=session_resets)
                 return
             tk["status"] = "fertig"
             # SWITCH-Signal auswerten (erste Zeile der Antwort)
@@ -560,18 +627,23 @@ def _process(text, files, sender="user", aufgabe_id=None, reply_channel_id=None)
                     elif sw_typ == "vorgang":
                         _post_text(_cmd_vorgang(sw_name), reply_channel_id, thread_root)
                 reply = "\n".join(reply_lines[1:]).strip()
-            _patch(tk["post_id"], f"✅ **#{tid}**{label} — _{title}_\n\n{(reply or '')[:15000]}")
+            _patch(tk["post_id"], f"✅ **{label_num}**{label} — _{title}_\n\n{(reply or '')[:15000]}")
+            if aufgabe_id:
+                _update_aufgaben_post(aufgabe_id, "DONE", preview=reply)
             sent = []
             for p in outfiles:
                 try:
                     _post_file(p, reply_channel_id, thread_root)
                     sent.append(p)
-                    log.info("Datei gesendet: %s", os.path.basename(p))
+                    log.info("[%s] Datei gesendet: %s", core.MACHINE, os.path.basename(p))
                 except Exception:
-                    log.exception("Konnte Datei nicht senden: %s", p)
+                    log.exception("[%s] Konnte Datei nicht senden: %s", core.MACHINE, p)
             if sent:
                 core.archive_sent(CHANNEL_NAME, sent)
-            _log_dialog(sender, text, reply, tid, work_dir, files, sent, "fertig", aufgabe_id)
+            log.info("[%s] task DONE aufgabe=A%s dauer=%.1fs resets=%d reply_len=%d",
+                     core.MACHINE, aufgabe_id, dauer_s, session_resets, len(reply or ""))
+            _log_dialog(sender, text, reply, tid, work_dir, files, sent, "fertig", aufgabe_id,
+                        dauer_s=dauer_s, session_resets=session_resets)
             # Aufgabe als fertig markieren
             if aufgabe_id:
                 with _aufgaben_lock:
@@ -579,11 +651,17 @@ def _process(text, files, sender="user", aufgabe_id=None, reply_channel_id=None)
                         _aufgaben[aufgabe_id]["status"] = "fertig"
                 _save_aufgaben()
         except Exception as e:
-            log.exception("Verarbeitung fehlgeschlagen")
+            dauer_s = round(time.time() - t_start, 1)
+            log.exception("[%s] task FEHLER aufgabe=A%s dauer=%.1fs: %s",
+                          core.MACHINE, aufgabe_id, dauer_s, e)
             tk["status"] = "fehler"
-            _patch(tk["post_id"], f"❌ **#{tid}**{label} Fehler — {e}")
-            _log_dialog(sender, text, str(e), tid, work_dir, files, [], "fehler", aufgabe_id)
+            _patch(tk["post_id"], f"❌ **{label_num}**{label} Fehler — {e}")
+            if aufgabe_id:
+                _update_aufgaben_post(aufgabe_id, "FEHLER")
+            _log_dialog(sender, text, str(e), tid, work_dir, files, [], "fehler", aufgabe_id,
+                        dauer_s=dauer_s)
         finally:
+            _spin_stop.set()
             tk["proc"] = None
 
 
@@ -719,7 +797,11 @@ def _flush_debounce(key):
         if aid is not None:
             with _aufgaben_lock:
                 _cur_aufgabe[0] = aid
+                # Wenn User auf Status-Post geantwortet hat → Thread dorthin verlegen
+                if _aufgaben.get(aid, {}).get("main_post_id") == root_id:
+                    _aufgaben[aid]["root_id"] = root_id
             _save_aufgaben()
+            _update_aufgaben_post(aid, "QUEUED")
             threading.Thread(target=_run_task, args=(merged_post, sender_name, aid),
                              kwargs={"reply_channel_id": rcid}, daemon=True).start()
             return
@@ -764,6 +846,7 @@ def _flush_debounce(key):
             if has:
                 _cur_aufgabe[0] = aid
                 _await_select[0] = False
+                _update_aufgaben_post(aid, "QUEUED")
                 threading.Thread(target=_run_task, args=(merged_post, sender_name, aid), kwargs={"reply_channel_id": rcid}, daemon=True).start()
                 return
     if m:
@@ -780,6 +863,7 @@ def _flush_debounce(key):
                 _post_text(f"↩️ Weiter mit **A{aid}** — {title}", rcid)
                 return
             merged_post["message"] = rest
+            _update_aufgaben_post(aid, "QUEUED")
             threading.Thread(target=_run_task, args=(merged_post, sender_name, aid), kwargs={"reply_channel_id": rcid}, daemon=True).start()
             return
 
@@ -790,21 +874,123 @@ def _flush_debounce(key):
         title = after.splitlines()[0][:50] if after else "Neue Aufgabe"
         aid = _open_aufgabe(title, root_id=merged_post.get("id"))
         _post_text(f"📋 **A{aid}** eroeffnet — _{title}_", rcid, merged_post.get("id"))
+        _update_aufgaben_post(aid, "QUEUED")
         if after:
             merged_post["message"] = after
             threading.Thread(target=_run_task, args=(merged_post, sender_name, aid), kwargs={"reply_channel_id": rcid}, daemon=True).start()
         return
 
-    # Normal: zu aktueller Aufgabe — nur beim allerersten Mal auto-anlegen
-    with _aufgaben_lock:
-        aid = _cur_aufgabe[0]
-    if aid is None:
-        title = merged_text.splitlines()[0][:50] if merged_text else "Aufgabe"
-        aid = _open_aufgabe(title, root_id=merged_post.get("id"))
+    # Normal: Top-Level-Hauptkanal → immer neue Aufgabe (eigener Thread pro Thema).
+    # Thread-Antworten (root_id gesetzt) wurden oben schon abgefangen.
+    title = merged_text.splitlines()[0][:50] if merged_text else "Aufgabe"
+    aid = _open_aufgabe(title, root_id=merged_post.get("id"))
+    _update_aufgaben_post(aid, "QUEUED")
     threading.Thread(target=_run_task, args=(merged_post, sender_name, aid), kwargs={"reply_channel_id": rcid}, daemon=True).start()
 
 
+def _ws_watchdog():
+    """Watchdog: wenn kein WS-Message seit STALE_SECONDS, WebSocket-Socket schliessen → Reconnect.
+
+    Strategie: nicht nur asyncio-Tasks canceln (das reicht nicht — der TCP-Socket bleibt
+    offen und init_websocket() kehrt nie zurueck). Wir schliessen den Socket direkt.
+    Das wirft eine Exception in recv(), init_websocket() kehrt zurueck, main()-Loop
+    reconnectet automatisch.
+    """
+    import asyncio as _asyncio
+    STALE = int(os.environ.get("DEMOBOT_WS_STALE", "90"))
+    CHECK = 30
+    _reconnecting = [False]
+    while True:
+        time.sleep(CHECK)
+        if _reconnecting[0]:
+            continue
+        last = _ws_last_activity[0]
+        if last <= 0:
+            continue
+        age = time.time() - last
+        if age <= STALE:
+            continue
+        log.warning("WS watchdog: kein Heartbeat seit %.0fs — erzwinge Reconnect", age)
+        _reconnecting[0] = True
+        _ws_last_activity[0] = time.time()  # reset damit kein Doppel-Trigger
+        try:
+            # Schicht 1: WebSocket-Socket direkt schliessen (erzwingt Exception in recv())
+            ws_obj = getattr(getattr(driver, "client", None), "websocket", None)
+            if ws_obj is not None:
+                loop = getattr(ws_obj, "_loop", None)
+                # websockets-Library: Protocol.close() ist eine Coroutine
+                # mattermostdriver websocket_client: hat .sock (raw socket)
+                closed = False
+                # Versuch 1: websockets-Protocol (async close via loop)
+                if loop and not loop.is_closed() and hasattr(ws_obj, "close"):
+                    async def _do_close():
+                        try:
+                            await ws_obj.close()
+                        except Exception:
+                            pass
+                    try:
+                        _asyncio.run_coroutine_threadsafe(_do_close(), loop).result(timeout=3)
+                        closed = True
+                        log.info("WS watchdog: websocket.close() erfolgreich")
+                    except Exception as e:
+                        log.warning("WS watchdog: websocket.close() fehlgeschlagen: %s", e)
+                # Versuch 2: raw socket (websocket_client .sock)
+                if not closed:
+                    sock = getattr(ws_obj, "sock", None)
+                    if sock is not None:
+                        try:
+                            sock.close()
+                            closed = True
+                            log.info("WS watchdog: raw socket geschlossen")
+                        except Exception as e:
+                            log.warning("WS watchdog: sock.close() fehlgeschlagen: %s", e)
+                # Versuch 3: asyncio-Tasks canceln (Fallback)
+                if not closed and loop and not loop.is_closed():
+                    def _cancel_all():
+                        for task in _asyncio.all_tasks(loop):
+                            task.cancel()
+                    loop.call_soon_threadsafe(_cancel_all)
+                    log.info("WS watchdog: Tasks cancelled (Fallback)")
+        except Exception as e:
+            log.warning("WS watchdog Fehler: %s", e)
+        finally:
+            # Reconnect-Flag nach kurzer Pause zuruecksetzen
+            threading.Timer(10.0, lambda: _reconnecting.__setitem__(0, False)).start()
+
+
+def _ws_ping_loop():
+    """Sendet alle 25s einen Ping-Frame in den WebSocket.
+
+    Verhindert NAT-Zombie: Router verwirft idle TCP-Verbindungen nach ~60-90s.
+    Ein Ping alle 25s haelt den NAT-Eintrag am Leben, so dass der Watchdog
+    nur bei echtem Ausfall auslöst (nicht bei Idle).
+    """
+    import asyncio as _asyncio
+    INTERVAL = 25
+    seq = [0]
+    while True:
+        time.sleep(INTERVAL)
+        try:
+            ws_obj = getattr(getattr(driver, "client", None), "websocket", None)
+            if ws_obj is None:
+                continue
+            loop = getattr(ws_obj, "_loop", None)
+            if loop is None or loop.is_closed():
+                continue
+            seq[0] += 1
+            msg = json.dumps({"action": "ping", "seq": seq[0]})
+            async def _send(m=msg):
+                await ws_obj.send(m)
+            fut = _asyncio.run_coroutine_threadsafe(_send(), loop)
+            fut.result(timeout=5)
+            _ws_last_activity[0] = time.time()  # Ping zaehlt als Aktivitaet
+            log.debug("WS ping #%d", seq[0])
+        except Exception as e:
+            log.debug("WS ping fehlgeschlagen: %s", e)
+
+
 async def event_handler(message):
+    _ws_last_activity[0] = time.time()   # jede WS-Nachricht = Verbindung lebt
     try:
         data = json.loads(message)
     except Exception:
@@ -860,6 +1046,14 @@ def main():
     _load_aufgaben()
     active = _get_active()
     log.info("State geladen: aktiv=%s (%s) → %s", active["name"], active["type"], active["dir"])
+    if not _ws_watchdog_started[0]:
+        _ws_watchdog_started[0] = True
+        threading.Thread(target=_ws_watchdog, daemon=True).start()
+        log.info("WS-Watchdog gestartet (stale=%ss)", os.environ.get("DEMOBOT_WS_STALE", "90"))
+    if not _ws_ping_started[0]:
+        _ws_ping_started[0] = True
+        threading.Thread(target=_ws_ping_loop, daemon=True).start()
+        log.info("WS-Ping gestartet (interval=25s)")
     while True:
         try:
             driver = _make_driver()
@@ -869,6 +1063,7 @@ def main():
             log.info("Verbunden als @%s | Kanal %s -> %s | Maschine %s | Owner-only:%s",
                      me.get("username"), CHANNEL_NAME, core.dir_for(CHANNEL_NAME),
                      core.MACHINE, bool(MM_OWNER))
+            _ws_last_activity[0] = time.time()  # reset bei neuer Verbindung
             driver.init_websocket(event_handler)
             log.warning("WebSocket beendet — reconnect in 5s")
         except Exception:

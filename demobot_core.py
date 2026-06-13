@@ -14,16 +14,22 @@ import re
 import json
 import shutil
 import socket
+import time
+import logging
 import datetime
 import threading
 import subprocess
 
 _session_lock = threading.Lock()
+log = logging.getLogger("demobot-core")
 MACHINE = os.environ.get("DEMOBOT_MACHINE") or socket.gethostname()
 
 BASE_DIR = os.environ.get("DEMOBOT_BASE", r"C:\projekte")
 CLAUDE_CMD = os.environ.get(
     "CLAUDE_CMD", r"C:\Users\Lenovo T460p\AppData\Roaming\npm\claude.cmd")
+LAST_CALL_FILE = os.path.join(
+    os.environ.get("USERPROFILE", r"C:\Users\Lenovo T460p"),
+    ".claude", "last_claude_call.txt")
 TIMEOUT = int(os.environ.get("DEMOBOT_TIMEOUT", "240"))
 VORGANG_BASE = os.environ.get("DEMOBOT_VORGANG_BASE",
     r"G:\Meine Ablage\ESALOW-Archiv\_vorgaenge")
@@ -51,6 +57,9 @@ APPEND_SYSTEM = (
     "ALLE Projekte: Verzeichnis C:\\projekte\\ auflisten (list_directory oder glob). "
     "Bei Projekt-Fragen immer das echte Verzeichnis nehmen, Registry nur fuer Metadaten. "
     "WICHTIG: Keine blockierenden Wartezeiten. Antworte auf Deutsch mit echten Umlauten. "
+    "IMMER-ANTWORTEN-REGEL: Schreibe zu JEDER Aufgabe einen sichtbaren Text — auch wenn du "
+    "nur Tool-Calls ausfuehrst. Niemals die Aufgabe abschliessen ohne erklaerenden Begleittext "
+    "(was wurde getan, was ist das Ergebnis, wie geht es weiter). Kein stilles Abarbeiten. "
     "SICHERHEIT STUFE 1 — Doppelte Bestaetigung erforderlich (niemals sofort ausfuehren): "
     "Laptop/PC herunterfahren, neu starten, ausschalten (shutdown, reboot, ausmachen, ausschalten). "
     "Vorgehen: 1) Zusammenfassen was du verstanden hast, 2) Fragen 'Bestaetigung erforderlich — antworte JA'. "
@@ -63,7 +72,13 @@ APPEND_SYSTEM = (
     "Bei 'demobot stoppen': warnen dass der Bot danach nicht mehr erreichbar ist, dann JA abwarten. "
     "Unbekannter Dienst oder Name unklar: ZUERST recherchieren was dieser Dienst ist "
     "(sc query, tasklist, Web-Suche falls noetig), dann kurz erklaeren was der Dienst tut, "
-    "dann Bestaetigung einholen bevor gestoppt wird."
+    "dann Bestaetigung einholen bevor gestoppt wird. "
+    "VPS-ZUGRIFF: Per SSH ueber Headscale-Mesh erreichbar als 'hetzner-vps'. "
+    "TEILEDATENBANK: Laeuft EXCLUSIV auf VPS. "
+    "Zugriff: ssh hetzner-vps \"sqlite3 /opt/priv-inventar-bot/teiledatenbank.db '.timeout 5000' 'SQL'\". "
+    "VPS-Dienste verwalten: ssh hetzner-vps \"systemctl restart|status <dienst>\". "
+    "NIEMALS lokal starten: priv-inventar-bot, villa-manager, fahrkartenbot. "
+    "demobot selbst laeuft NUR lokal — nie auf VPS deployen."
 )
 
 
@@ -226,9 +241,10 @@ def _looks_too_long(reply):
     return any(m in r for m in _TOO_LONG_MARKERS)
 
 
-def _recent_context(d, channel, limit=12, maxlen=1600):
-    """Kurzer Gespraechs-Kontext aus logs/dialog.jsonl (fuer Reseed nach Reset).
-    Gefiltert nach Aufgaben-ID des Kanals, damit Threads nicht vermischt werden."""
+def _recent_context(d, channel, limit=30, maxlen=6000):
+    """Kurzer Gespraechs-Kontext aus logs/dialog.jsonl.
+    Gefiltert nach Aufgaben-ID des Kanals, damit Threads nicht vermischt werden.
+    cross=True liefert zusaetzlich Top-Level-Eintraege (kanaluebergreifend)."""
     f = os.path.join(d, "logs", "dialog.jsonl")
     if not os.path.exists(f):
         return ""
@@ -251,11 +267,14 @@ def _recent_context(d, channel, limit=12, maxlen=1600):
         return ""
     parts = []
     for e in rows[-limit:]:
+        ts = (e.get("ts") or "")[:10]  # nur Datum
+        proj = e.get("projekt") or ""
         q = " ".join((e.get("in") or "").split())
         a = " ".join((e.get("out") or "").split())
         if not (q or a):
             continue
-        parts.append(f"- F: {q[:110]} | A: {a[:110]}")
+        proj_tag = f" [{proj}]" if proj and proj != channel.split("_")[0] else ""
+        parts.append(f"[{ts}]{proj_tag} F: {q[:130]} | A: {a[:130]}")
     return "\n".join(parts)[:maxlen]
 
 
@@ -271,10 +290,33 @@ def _reseed_prefix(d, channel):
             "\nKnuepfe daran an; frage nach falls Details fehlen.]")
 
 
+def _new_session_prefix(d, channel):
+    """Kurz-Kontext fuer den Start einer neuen Session (z.B. nach Bot-Neustart).
+    Injiziert die letzten Dialoge damit der Bot sich 'erinnert'."""
+    ctx = _recent_context(d, channel)
+    if not ctx:
+        return ""
+    return ("[System: Neue Session (Gedaechtnis-Kontext aus Verlauf):\n"
+            + ctx +
+            "\nKnuepfe daran an falls relevant; frage nach falls Details fehlen.]")
+
+
+def _touch_last_call():
+    try:
+        with open(LAST_CALL_FILE, "w") as f:
+            f.write(datetime.datetime.now().isoformat())
+    except Exception:
+        pass
+
+
 def _run_once(channel, d, prompt, on_progress, on_start, extra_append,
               inbox_dir, outbox_dir):
     """Ein einzelner claude-Lauf (Streaming). Speichert die neue Session-ID.
     Gibt (reply_text, outbox_files) zurueck."""
+    _touch_last_call()
+    t0 = time.time()
+    sid_before = _load_session(d, channel)
+    log.info("[%s] claude-call START kanal=%s sid=%s", MACHINE, channel, sid_before[:8] if sid_before else "neu")
     cmd = _build_cmd(channel, d, stream=True, extra_append=extra_append,
                      inbox_dir=inbox_dir, outbox_dir=outbox_dir)
     # Prompt via stdin (NICHT -p): mehrzeilige Aufgaben bleiben erhalten und
@@ -338,8 +380,13 @@ def _run_once(channel, d, prompt, on_progress, on_start, extra_append,
         except Exception:
             pass
 
+    dauer = round(time.time() - t0, 1)
     if new_sid:
         _save_session(d, channel, new_sid)
+    if reply:
+        log.info("[%s] claude-call DONE kanal=%s dauer=%.1fs reply_len=%d", MACHINE, channel, dauer, len(reply))
+    else:
+        log.warning("[%s] claude-call LEER kanal=%s dauer=%.1fs — kein Text vom CLI", MACHINE, channel, dauer)
     return (reply, _collect_outbox(outbox_dir))
 
 
@@ -381,31 +428,71 @@ def run_stream(channel, user_text, incoming_files=None, on_progress=None, on_sta
                 except Exception:
                     pass
 
+    t0_total = time.time()
     sid = _load_session(d, channel)
     resuming = bool(sid)
+    session_resets = 0
+
+    # Gedaechtnis-Kontext bei neuer Session (kein bestehender Resume): letzte Dialoge voranstellen
+    if not sid:
+        mem = _new_session_prefix(d, channel)
+        if mem:
+            prompt = mem + "\n\n---\n\n" + prompt
 
     # Schicht 1 (vorbeugend): zu grosses Transkript -> frisch starten mit Reseed
     sz = _session_size(d, sid)
     if sid and sz > CTX_LIMIT_BYTES:
+        log.warning("[%s] Schicht-1: Session zu gross (%.1f MB) — reset + reseed kanal=%s",
+                    MACHINE, sz / 1_000_000, channel)
         _say(f"♻️ Session war gross ({sz/1_000_000:.1f} MB) — frisch gestartet "
              f"mit Kurz-Kontext aus dem Verlauf.")
         _save_session(d, channel, None)
         prompt = _reseed_prefix(d, channel) + "\n\n---\n\n" + prompt
         resuming = False
+        session_resets += 1
 
     reply, outfiles = _run_once(channel, d, prompt, on_progress, on_start,
                                 extra_append, _inbox, _outbox)
 
     # Schicht 2 (Notfall): Resume trotzdem ins Limit gelaufen -> Reset + Reseed + 1x Retry
     if resuming and _looks_too_long(reply):
+        log.warning("[%s] Schicht-2: Kontext-Limit im Resume — reset + reseed + retry kanal=%s",
+                    MACHINE, channel)
         _say("♻️ Kontext-Limit erreicht — Session zurueckgesetzt, Kurz-Kontext "
              "uebernommen, neuer Versuch.")
         _save_session(d, channel, None)
         retry_prompt = _reseed_prefix(d, channel) + "\n\n---\n\n" + prompt
         reply, outfiles = _run_once(channel, d, retry_prompt, on_progress, on_start,
                                     extra_append, _inbox, _outbox)
+        session_resets += 1
 
-    return (reply or "(fertig, keine Textantwort)", outfiles)
+    # Schicht 3: Keine Textantwort -> Session zuruecksetzen + frisch nachfragen
+    if not reply:
+        log.warning("[%s] Schicht-3: leere Antwort — session reset + text-retry kanal=%s",
+                    MACHINE, channel)
+        _save_session(d, channel, None)
+        session_resets += 1
+        reply2, extra_files = _run_once(
+            channel, d,
+            "Fasse in 1-2 Saetzen auf Deutsch zusammen was du fuer den User getan hast. "
+            "Falls du noch nichts getan hast, beantworte die letzte Anfrage kurz.",
+            on_progress, on_start, extra_append, _inbox, _outbox)
+        reply = reply2
+        outfiles = outfiles or extra_files
+
+    dauer_total = round(time.time() - t0_total, 1)
+    if not reply:
+        log.error("[%s] KEIN TEXT nach %d Versuchen, %.1fs, kanal=%s",
+                  MACHINE, session_resets + 1, dauer_total, channel)
+
+    final = reply or "❌ Keine Antwort (Claude hat zweimal keinen Text geliefert — bitte neu versuchen)."
+    # Metadaten als Attribut fuer den Caller (optional nutzbar)
+    run_stream.last_meta = {
+        "dauer_s": dauer_total,
+        "session_resets": session_resets,
+        "machine": MACHINE,
+    }
+    return (final, outfiles)
 
 
 def archive_sent(channel, pfade):

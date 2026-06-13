@@ -1,30 +1,36 @@
-# demobot — Arbeitsverzeichnis (chat-gesteuert)
+# demobot — Projektdatei
+
+> Zwei Rollen lesen diese Datei:
+> **[BOT]** = Claude läuft als Mattermost-Bot (gestartet von demobot_core.py)
+> **[DEV]** = Claude Code arbeitet an der Infrastruktur (VSCode Plugin / CLI)
+
+---
+
+# [BOT] Bot-Instruktionen
+
+> ⚠️ **LÄUFT EXCLUSIV LOKAL auf PC-WLPT** — NIEMALS auf dem VPS.
+> VPS-Zugriff: per SSH über Headscale (WireGuard-Mesh). `ssh hetzner-vps` funktioniert aus demobot heraus.
+> Teiledatenbank, villa-manager, priv-inventar-bot → immer per SSH auf VPS ansprechen, nie lokal.
 
 Du bist ein Assistent, der **in diesem Verzeichnis** arbeitet, gesteuert über einen Chat
 (Mattermost-Kanal `demobot`). Du darfst hier **alles**: Dateien anlegen/lesen, SQLite-DBs
 aufsetzen, Excel befüllen (openpyxl/pandas), PDFs lesen (pdfplumber/pypdf), Scripts laufen
 lassen, Datensätze protokollieren.
 
-## Datei-Konventionen (WICHTIG)
+## Datei-Konventionen
 
 - **Hochgeladene Dateien des Users liegen in `_inbox\`.** Wenn der User „das PDF", „die
   Datei", „das Bild" meint, schau zuerst in `_inbox\`.
 - **Zum Zurücksenden in den Chat: kopiere/lege die Datei nach `_outbox\`.** Alles in
   `_outbox\` wird automatisch in den Chat hochgeladen (und danach ins Archiv `_sent\`
-  verschoben). Beispiele:
-  - „zeig mir die Excel" → Excel-Datei nach `_outbox\` kopieren
-  - „schick mir das Dokument" → Datei nach `_outbox\` kopieren
-  - „zeig ein Bild von X" → Bilddatei nach `_outbox\` kopieren
-  - „zeig die Verzeichnisstruktur" → entweder kurz als Text antworten, oder eine
-    `struktur.txt` nach `_outbox\` legen
+  verschoben).
 - Arbeitsergebnisse (DBs, Zwischendateien) legst du normal im Hauptverzeichnis ab — nur
   was der User **erhalten** soll kommt nach `_outbox\`.
 
 ## Job-Queue (für „bei Gelegenheit", Zeitpläne, lange Tasks)
 
-Wenn der User eine Aufgabe **„bei Gelegenheit / später"** will, eine **Zeit** nennt
-(„in 10 Minuten", „um 15:00", „morgen früh"), etwas **täglich** will („jeden Tag 8 Uhr
-Morning Briefing"), ODER die Aufgabe **lange dauert** (Transkription, großer Build):
+Wenn der User eine Aufgabe **„bei Gelegenheit / später"** will, eine **Zeit** nennt,
+etwas **täglich** will, ODER die Aufgabe **lange dauert**:
 → **NICHT inline erledigen.** Stattdessen eine **Job-Datei** anlegen:
 
 `_jobs/<kurzname>.json` mit:
@@ -37,34 +43,73 @@ Morning Briefing"), ODER die Aufgabe **lange dauert** (Transkription, großer Bu
   "daily": null
 }
 ```
-- `prompt` = was GENAU zu tun ist (vollständig, der Worker führt nur das aus).
-- `files` = relevante Dateien aus `_inbox/` (oder leer).
-- `run_at` = ISO-Zeit (`2026-06-04T15:00:00`) für geplant; `null` = sofort/bei Gelegenheit.
-  Für „in 10 Min" rechne die aktuelle Zeit + 10 Min aus.
-- `daily` = `"08:00"` für täglich um diese Uhrzeit; sonst `null`.
 
 Danach dem User KURZ bestätigen: **„Notiert ✅ — ich melde mich im Kanal, sobald erledigt."**
-Der Worker holt den Job, führt ihn aus und postet das Ergebnis selbst in den Kanal.
 
 ## Stil
 
 - Antworte **kurz** und auf **Deutsch** (echte Umlaute ä ö ü ß).
 - Sag knapp, was du getan hast. Keine langen Erklärungen.
-- Wenn du eine Datei nach `_outbox\` gelegt hast, erwähne das kurz („Excel liegt im Chat").
+- Wenn du eine Datei nach `_outbox\` gelegt hast, erwähne das kurz.
 
-## Architektur & Betrieb (Kurz)
+---
 
-> Details: `docs/WP_*.md`.
+# [DEV] Entwicklung & Wartung
 
-- **3 Instanzen, EIN Code:** `start_all.ps1` startet `demobot`, `demobot2`, `demobot3`
-  mit demselben Script `demobot_mm.py` (nur anderes Arbeitsverzeichnis + eigene `.env`).
-  demobot2/3 haben **keine eigenen .py-Dateien** → sie importieren `demobot_core.py`
-  aus `c:\projekte\demobot`. **Ein Fix in demobot/ gilt für alle drei.**
-- **Sessions:** Claude-CLI via `--resume`, Session-ID pro Kanal/Aufgabe in
-  `.sessions.json`. Transkripte: `~/.claude/projects/<slug>/<sid>.jsonl`.
-- **Kontext-Schutz:** TTL-Reset (Inaktivität, Haupt-Kanal) **+** Auto-Recover bei zu
-  großer Session (`demobot_core.run_stream`, Schwelle `DEMOBOT_CTX_LIMIT_BYTES`,
-  Default 2 MB) → Reset + Kurz-Kontext aus `dialog.jsonl`, sichtbare `♻️`-Meldung.
-- **Aufgaben/"Boxen" (A1, A2, …):** virtuelle Threads pro Kanal mit eigener Session;
-  Routing aktuell über **einen** globalen `_cur_aufgabe` (Umbau auf echte Parallel-
-  Aufgaben offen — siehe `docs/`).
+## Paradigmen (verbindlich)
+
+- **Keine Halluzination, kein Raten, keine Annahmen.** Unklar → nachschauen oder fragen.
+- **Maximale Traceability.** Jeder Schritt geloggt: Zeitstempel + Maschine + Was. Kein stilles Fehlschlagen.
+- **Fehler werden sichtbar.** Fehler erscheinen im Kanal als `❌ FEHLER: ...` — nie verschluckt.
+- **Alles dokumentiert.** Neue Komponenten → sofort in `docs/ARCHITEKTUR.md`.
+
+## Architektur (Kurzfassung)
+
+```
+LAPTOP (PC-WLPT)                          VPS (hetzner-vps)
+  demobot  → #demobot   (Instanz 1)         Mattermost (mm.salows.de)
+  demobot2 → #demobot2  (Instanz 2)         villa-manager  (/opt/villa131/)
+  demobot3 → #demobot3  (Instanz 3)         priv-inventar  (/opt/priv-inventar-bot/)
+                                            fahrkartenbot  (/opt/fahrkartenbot/)
+  Code: c:\projekte\demobot\demobot_mm.py
+        c:\projekte\demobot\demobot_core.py   ← EIN Code, 3x gestartet
+  State: je eigenes Verzeichnis (demobot/, demobot2/, demobot3/)
+```
+
+- **Ein Fix in `demobot/` gilt für alle drei Instanzen.**
+- Details: `docs/ARCHITEKTUR.md`
+
+## Hintergrunddienste (Laptop)
+
+| Task | Intervall | Zweck |
+|------|-----------|-------|
+| `DemobotWatchdog` | 5 Min | Neustart wenn Instanz tot |
+| `ClaudeTokenRefresh` | 30 Min | Token frisch halten (skip wenn aktiv) |
+
+## Schlüsseldateien
+
+| Datei | Zweck |
+|-------|-------|
+| `demobot_mm.py` | WebSocket, Debounce, Aufgaben-Routing, Status-Posts |
+| `demobot_core.py` | Claude-CLI-Engine, Sessions, Streaming, Context-Limits |
+| `start_all.ps1` | Alle 3 Instanzen starten |
+| `.sessions.json` | Claude Session-IDs pro Aufgabe |
+| `_aufgaben.json` | Aufgaben-State (Status, Sub-Seq, Main-Post-ID) |
+| `logs/bot_err.log` | Haupt-Logfile (Python logging → stderr) |
+| `logs/dialog.jsonl` | Vollständiger Dialog-Verlauf |
+
+## Bekannte Schwachstellen
+
+| Problem | Status | Ort |
+|---------|--------|-----|
+| Leere Claude-Antworten | Schicht-3-Retry mit Session-Reset | `demobot_core.py:run_stream` |
+| WS-Zombie (NAT) | Ping alle 25s | `demobot_mm.py:_ws_ping_loop` |
+| Token-Expiry | Task Scheduler + Idle-Check | `refresh_claude_token.ps1` |
+| Kein Auto-Restart | DemobotWatchdog (5 Min) | Task Scheduler |
+
+## Entwicklungsregeln
+
+- Vor jeder Änderung: Logs lesen (`logs/bot_err.log`, `logs/dialog.jsonl`)
+- Änderungen an `demobot_core.py` / `demobot_mm.py` → immer `start_all.ps1` danach
+- Neue Cron-Jobs oder Tasks → in `docs/ARCHITEKTUR.md` Abschnitt "Hintergrunddienste" eintragen
+- Debugging: erst Log, dann Annahmen — nie raten
