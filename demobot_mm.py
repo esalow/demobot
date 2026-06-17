@@ -340,6 +340,17 @@ GO_WORDS = ["deckel drauf", "deckeldrauf", "leg los", "mach es", "ausführen",
 STATUS_WORDS = {"was läuft", "was laeuft", "was läuft?", "was laeuft?", "status",
                 "wer arbeitet", "was machst du"}
 
+MODEL_MAP = {
+    "opus":   "claude-opus-4-6",
+    "sonnet": "claude-sonnet-4-6",
+    "haiku":  "claude-haiku-4-5-20251001",
+}
+_MODEL_TRIGGER = re.compile(r'\b(opus|sonnet|haiku)\b', re.I)
+_MODEL_CONTEXT = re.compile(
+    r'model(?:l)?|stell|wechsel|switch|umstell|'
+    r'\bauf\s+(?:opus|sonnet|haiku)\b|'
+    r'\bzu\s+(?:opus|sonnet|haiku)\b', re.I)
+
 PLAN_HINT = (
     "MODUS: GEMEINSAM ENTWICKELN (Dialog/Planung). Besprich die Aufgabe mit dem User, "
     "frag nach, mach Vorschlaege, schau bei Bedarf Dateien an (nur LESEN). "
@@ -828,6 +839,21 @@ def _process(text, files, sender="user", aufgabe_id=None, reply_channel_id=None)
             tk["proc"] = None
 
 
+def _switch_model(name):
+    key = name.lower()
+    model_id = MODEL_MAP.get(key, key)
+    path = os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+    data["model"] = model_id
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    return f"✅ Modell auf **{model_id}** gestellt — gilt ab der nächsten Anfrage."
+
+
 def _cmd_projekt(name):
     if not name:
         a = _get_active()
@@ -931,6 +957,12 @@ def _handle_post(post, sender_name, aufgabe_id=None, reply_channel_id=None):
     m = re.match(r"(?:stop|unterbrich|abbrechen|abbruch|halt)\s*#?(\d+)", low)
     if m:
         _post_text(_stop(int(m.group(1))), reply_channel_id)
+        return
+
+    # Model-Switch: "auf opus", "modell wechseln zu haiku", etc.
+    m = _MODEL_TRIGGER.search(low)
+    if m and _MODEL_CONTEXT.search(low):
+        _post_text(_switch_model(m.group(1)), reply_channel_id)
         return
 
     if not text and not incoming:
