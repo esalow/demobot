@@ -262,7 +262,6 @@ driver = None
 BOT_USER_ID = None
 _sem = threading.Semaphore(AUFGABEN_MAX)
 _ws_last_activity = [0.0]   # Timestamp letzter WS-Message; 0 = noch nie
-_ws_watchdog_started = [False]
 _ws_ping_started = [False]
 _tasks = {}
 _task_lock = threading.Lock()
@@ -630,7 +629,8 @@ def _open_aufgabe(title, work_dir=None, name=None, root_id=None):
         _aufgabe_seq[0] += 1
         aid = _aufgabe_seq[0]
         _aufgaben[aid] = {"id": aid, "title": title[:50],
-                          "session_key": f"{CHANNEL_NAME}_A{aid}", "status": "aktiv",
+                          "session_key": f"mm_{root_id}" if root_id else f"{CHANNEL_NAME}_A{aid}",
+                          "status": "aktiv",
                           "dir": work_dir or active["dir"],
                           "name": name or active["name"],
                           "root_id": root_id,
@@ -758,11 +758,14 @@ def _process(text, files, sender="user", aufgabe_id=None, reply_channel_id=None)
         threading.Thread(target=_run_spinner, daemon=True).start()
         t_start = time.time()
         try:
+            aufgabe_filter = f"A{aufgabe_id}" if aufgabe_id else None
+            root_id_val = (a or {}).get("root_id") or None
             reply, outfiles = core.run_stream(
                 session_key, text, files,
                 on_progress=on_progress, on_start=on_start,
                 on_notice=lambda m: _post_text(m, reply_channel_id, thread_root),
-                work_dir=work_dir, inbox_dir=INBOX, outbox_dir=OUTBOX)
+                work_dir=work_dir, inbox_dir=INBOX, outbox_dir=OUTBOX,
+                aufgabe_filter=aufgabe_filter, root_id=root_id_val)
             meta = getattr(core.run_stream, "last_meta", {})
             dauer_s = meta.get("dauer_s", round(time.time() - t_start, 1))
             session_resets = meta.get("session_resets", 0)
@@ -891,6 +894,32 @@ def _handle_post(post, sender_name, aufgabe_id=None, reply_channel_id=None):
     # Zurück zu demobot
     if low_c in {"/zurück", "/zurueck", "/home"}:
         _post_text(_cmd_zurueck(), reply_channel_id)
+        return
+
+    # Deploy: git pull + Service-Neustart
+    if low_c in {"/deploy", "/update"}:
+        def _do_deploy(rcid=reply_channel_id):
+            import subprocess as _sp
+            bot_dir = os.path.dirname(os.path.abspath(__file__))
+            r = _sp.run(["git", "-C", bot_dir, "pull"],
+                        capture_output=True, text=True, timeout=30)
+            if r.returncode != 0:
+                _post_text(f"❌ git pull fehlgeschlagen:\n```\n{(r.stderr or r.stdout)[:400]}\n```", rcid)
+                return
+            out = (r.stdout or "").strip()
+            if "Already up to date" in out:
+                _post_text("✅ Bereits aktuell — kein Neustart nötig.", rcid)
+                return
+            _post_text(f"✅ Update:\n```\n{out[:300]}\n```\n🔄 Neustart in 3s …", rcid)
+            time.sleep(3)
+            svc = os.environ.get("DEMOBOT_SERVICE_NAME", f"{core.MACHINE}-server-bot")
+            nssm_exe = r"C:\tools\nssm\win64\nssm.exe"
+            if os.path.exists(nssm_exe):
+                _sp.Popen([nssm_exe, "restart", svc])
+            else:
+                _post_text("⚠️ nssm nicht gefunden — bitte manuell neu starten.", rcid)
+        threading.Thread(target=_do_deploy, daemon=True).start()
+        _post_text("🔄 Prüfe auf Updates …", reply_channel_id)
         return
 
     # Status
@@ -1052,76 +1081,6 @@ def _flush_debounce(key):
     threading.Thread(target=_run_task, args=(merged_post, sender_name, aid), kwargs={"reply_channel_id": rcid}, daemon=True).start()
 
 
-def _ws_watchdog():
-    """Watchdog: wenn kein WS-Message seit STALE_SECONDS, WebSocket-Socket schliessen → Reconnect.
-
-    Strategie: nicht nur asyncio-Tasks canceln (das reicht nicht — der TCP-Socket bleibt
-    offen und init_websocket() kehrt nie zurueck). Wir schliessen den Socket direkt.
-    Das wirft eine Exception in recv(), init_websocket() kehrt zurueck, main()-Loop
-    reconnectet automatisch.
-    """
-    import asyncio as _asyncio
-    STALE = int(os.environ.get("DEMOBOT_WS_STALE", "90"))
-    CHECK = 30
-    _reconnecting = [False]
-    while True:
-        time.sleep(CHECK)
-        if _reconnecting[0]:
-            continue
-        last = _ws_last_activity[0]
-        if last <= 0:
-            continue
-        age = time.time() - last
-        if age <= STALE:
-            continue
-        log.warning("WS watchdog: kein Heartbeat seit %.0fs — erzwinge Reconnect", age)
-        _reconnecting[0] = True
-        _ws_last_activity[0] = time.time()  # reset damit kein Doppel-Trigger
-        try:
-            # Schicht 1: WebSocket-Socket direkt schliessen (erzwingt Exception in recv())
-            ws_obj = getattr(getattr(driver, "client", None), "websocket", None)
-            if ws_obj is not None:
-                loop = getattr(ws_obj, "_loop", None)
-                # websockets-Library: Protocol.close() ist eine Coroutine
-                # mattermostdriver websocket_client: hat .sock (raw socket)
-                closed = False
-                # Versuch 1: websockets-Protocol (async close via loop)
-                if loop and not loop.is_closed() and hasattr(ws_obj, "close"):
-                    async def _do_close():
-                        try:
-                            await ws_obj.close()
-                        except Exception:
-                            pass
-                    try:
-                        _asyncio.run_coroutine_threadsafe(_do_close(), loop).result(timeout=3)
-                        closed = True
-                        log.info("WS watchdog: websocket.close() erfolgreich")
-                    except Exception as e:
-                        log.warning("WS watchdog: websocket.close() fehlgeschlagen: %s", e)
-                # Versuch 2: raw socket (websocket_client .sock)
-                if not closed:
-                    sock = getattr(ws_obj, "sock", None)
-                    if sock is not None:
-                        try:
-                            sock.close()
-                            closed = True
-                            log.info("WS watchdog: raw socket geschlossen")
-                        except Exception as e:
-                            log.warning("WS watchdog: sock.close() fehlgeschlagen: %s", e)
-                # Versuch 3: asyncio-Tasks canceln (Fallback)
-                if not closed and loop and not loop.is_closed():
-                    def _cancel_all():
-                        for task in _asyncio.all_tasks(loop):
-                            task.cancel()
-                    loop.call_soon_threadsafe(_cancel_all)
-                    log.info("WS watchdog: Tasks cancelled (Fallback)")
-        except Exception as e:
-            log.warning("WS watchdog Fehler: %s", e)
-        finally:
-            # Reconnect-Flag nach kurzer Pause zuruecksetzen
-            threading.Timer(10.0, lambda: _reconnecting.__setitem__(0, False)).start()
-
-
 def _ws_ping_loop():
     """Sendet alle 25s einen Ping-Frame in den WebSocket.
 
@@ -1219,10 +1178,6 @@ def main():
     _load_aufgaben()
     active = _get_active()
     log.info("State geladen: aktiv=%s (%s) → %s", active["name"], active["type"], active["dir"])
-    if not _ws_watchdog_started[0]:
-        _ws_watchdog_started[0] = True
-        threading.Thread(target=_ws_watchdog, daemon=True).start()
-        log.info("WS-Watchdog gestartet (stale=%ss)", os.environ.get("DEMOBOT_WS_STALE", "90"))
     if not _ws_ping_started[0]:
         _ws_ping_started[0] = True
         threading.Thread(target=_ws_ping_loop, daemon=True).start()
