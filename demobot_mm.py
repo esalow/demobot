@@ -79,6 +79,44 @@ API_BASE = f"{MM_SCHEME}://{MM_URL}/api/v4"
 AUTH_H = {"Authorization": "Bearer " + MM_TOKEN}
 DEMOBOT_DIR = core.dir_for(CHANNEL_NAME)
 
+# Session-Recovery via SSH → MM-Postgres
+MM_SSH_HOST = os.environ.get("MM_SSH_HOST", MM_URL)
+MM_SSH_USER = os.environ.get("MM_SSH_USER", "root")
+MM_SSH_KEY  = os.environ.get("MM_SSH_KEY",
+    r"C:\Users\Lenovo T460p\.ssh\id_rsa_gpubox")
+MM_PG_CONTAINER = os.environ.get("MM_PG_CONTAINER", "mattermost-postgres-1")
+MM_PG_DB    = os.environ.get("MM_PG_DB",   "mattermost")
+MM_PG_USER  = os.environ.get("MM_PG_USER", "mmuser")
+
+_SES_RE = re.compile(r'ses:([a-f0-9][a-f0-9-]{7,})')
+
+
+def _recover_session_from_mm(session_key, work_dir, thread_root_id, channel_id):
+    """SSH zu MM-Host → psql → letzte 20 Posts im Thread → ses:xxx parsen → resume."""
+    if not thread_root_id or not channel_id:
+        return None
+    sql = (f"SELECT message FROM posts WHERE channel_id='{channel_id}' "
+           f"AND root_id='{thread_root_id}' ORDER BY create_at DESC LIMIT 20;")
+    cmd = ["ssh",
+           "-i", MM_SSH_KEY,
+           "-o", "StrictHostKeyChecking=no",
+           "-o", "ConnectTimeout=10",
+           "-o", "BatchMode=yes",
+           f"{MM_SSH_USER}@{MM_SSH_HOST}",
+           f"docker exec {MM_PG_CONTAINER} psql -U {MM_PG_USER} -d {MM_PG_DB} -t -c \"{sql}\""]
+    try:
+        r = __import__("subprocess").run(cmd, capture_output=True, text=True, timeout=20)
+        m = _SES_RE.search(r.stdout + r.stderr)
+        if m:
+            sid = m.group(1)
+            core._save_session(work_dir, session_key, sid)
+            log.info("[demobot] Session recovered from MM DB: %s (thread %s…)",
+                     sid[:8], thread_root_id[:8])
+            return sid
+    except Exception as e:
+        log.warning("[demobot] Session-Recovery fehlgeschlagen: %s", e)
+    return None
+
 _channel_type_cache = {}  # channel_id -> 'O'/'P'/'D'/'G'
 
 def _get_channel_type(channel_id):
@@ -608,7 +646,9 @@ def _render_live(tk):
     icon = {"läuft": "▶️", "fertig": "✅", "abgebrochen": "⏹️", "fehler": "❌"}.get(tk["status"], "▶️")
     spin = f" `{tk.get('spinner', '')}`" if tk["status"] == "läuft" else ""
     num = tk.get("label_num") or f"#{tk['id']}"
-    head = f"{icon} **{num}**{tk.get('label', '')}{spin} {tk['status']} — _{tk['title']}_"
+    sid = tk.get("session_id")
+    ses = (f" `ses:{sid[:8]}`" if sid else "")
+    head = f"{icon} **{num}**{tk.get('label', '')}{spin}{ses} {tk['status']} — _{tk['title']}_"
     steps = tk["steps"][-8:]
     return head + ("\n" + "\n".join(steps) if steps else "")
 
@@ -738,7 +778,7 @@ def _process(text, files, sender="user", aufgabe_id=None, reply_channel_id=None)
                         root_id=thread_root)
     tk = {"id": tid, "title": title, "status": "läuft", "proc": None,
           "post_id": post["id"],
-          "steps": [], "last": 0.0,
+          "steps": [], "last": 0.0, "session_id": None,
           "aufgabe_id": aufgabe_id, "label": label, "label_num": label_num}
     with _task_lock:
         _tasks[tid] = tk
@@ -751,6 +791,10 @@ def _process(text, files, sender="user", aufgabe_id=None, reply_channel_id=None)
             return
         tk["steps"].append(step)
         _update_live(tk)
+
+    def on_session(sid):
+        tk["session_id"] = sid
+        _update_live(tk, force=True)
 
     with _sem:
         if tk["status"] == "abgebrochen":
@@ -773,12 +817,17 @@ def _process(text, files, sender="user", aufgabe_id=None, reply_channel_id=None)
         try:
             aufgabe_filter = f"A{aufgabe_id}" if aufgabe_id else None
             root_id_val = (a or {}).get("root_id") or None
+            # Session-Recovery: kein lokaler Store → MM-DB befragen
+            if not core._load_session(work_dir, session_key) and root_id_val:
+                _recover_session_from_mm(session_key, work_dir,
+                                         root_id_val, reply_channel_id or MM_CHANNEL_ID)
             reply, outfiles = core.run_stream(
                 session_key, text, files,
                 on_progress=on_progress, on_start=on_start,
                 on_notice=lambda m: _post_text(m, reply_channel_id, thread_root),
                 work_dir=work_dir, inbox_dir=INBOX, outbox_dir=OUTBOX,
-                aufgabe_filter=aufgabe_filter, root_id=root_id_val)
+                aufgabe_filter=aufgabe_filter, root_id=root_id_val,
+                on_session=on_session)
             meta = getattr(core.run_stream, "last_meta", {})
             dauer_s = meta.get("dauer_s", round(time.time() - t_start, 1))
             session_resets = meta.get("session_resets", 0)
@@ -803,7 +852,9 @@ def _process(text, files, sender="user", aufgabe_id=None, reply_channel_id=None)
                     elif sw_typ == "vorgang":
                         _post_text(_cmd_vorgang(sw_name), reply_channel_id, thread_root)
                 reply = "\n".join(reply_lines[1:]).strip()
-            _patch(tk["post_id"], f"✅ **{label_num}**{label} — _{title}_\n\n{(reply or '')[:15000]}")
+            ses_fin = tk.get("session_id") or meta.get("session_id")
+            ses_tag = (f" `ses:{ses_fin[:8]}`" if ses_fin else "")
+            _patch(tk["post_id"], f"✅ **{label_num}**{label}{ses_tag} — _{title}_\n\n{(reply or '')[:15000]}")
             if aufgabe_id:
                 _update_aufgaben_post(aufgabe_id, "DONE", preview=reply)
             sent = []

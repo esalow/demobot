@@ -36,9 +36,6 @@ MAX_TIMEOUT     = int(os.environ.get("DEMOBOT_MAX_TIMEOUT", "3600"))
 VORGANG_BASE = os.environ.get("DEMOBOT_VORGANG_BASE",
     r"G:\Meine Ablage\ESALOW-Archiv\_vorgaenge")
 CLAUDE_META = os.environ.get("DEMOBOT_CLAUDE_META", r"C:\projekte\claude-meta")
-# Ab dieser Transkript-Groesse (Bytes) wird die Session vorbeugend frisch gestartet
-# (mit Kurz-Kontext aus dialog.jsonl), bevor sie ins Kontext-Limit laeuft. Tunebar.
-CTX_LIMIT_BYTES = int(os.environ.get("DEMOBOT_CTX_LIMIT_BYTES", str(2_000_000)))
 
 APPEND_SYSTEM = (
     "KONTEXT: Du wirst per Mattermost gesteuert. Nachrichten kommen oft von Sprach-"
@@ -373,7 +370,7 @@ def _touch_last_call():
 
 
 def _run_once(channel, d, prompt, on_progress, on_start, extra_append,
-              inbox_dir, outbox_dir):
+              inbox_dir, outbox_dir, on_session=None):
     """Ein einzelner claude-Lauf (Streaming). Speichert die neue Session-ID.
     Gibt (reply_text, outbox_files) zurueck."""
     _touch_last_call()
@@ -434,6 +431,12 @@ def _run_once(channel, d, prompt, on_progress, on_start, extra_append,
             t = e.get("type")
             if t == "system" and e.get("session_id"):
                 new_sid = e["session_id"]
+                if on_session and new_sid:
+                    try:
+                        on_session(new_sid)
+                    except Exception:
+                        pass
+                    on_session = None  # nur einmal feuern
             elif t == "assistant":
                 for b in e.get("message", {}).get("content", []):
                     bt = b.get("type")
@@ -473,17 +476,16 @@ def _run_once(channel, d, prompt, on_progress, on_start, extra_append,
 
 def run_stream(channel, user_text, incoming_files=None, on_progress=None, on_start=None,
                on_notice=None, extra_append="", work_dir=None, inbox_dir=None, outbox_dir=None,
-               aufgabe_filter=None, root_id=None):
+               aufgabe_filter=None, root_id=None, on_session=None):
     """Fuehrt claude LIVE aus. on_progress(text) je Schritt, on_start(proc) sobald
     der Prozess laeuft (fuer stop). extra_append = zusaetzlicher System-Prompt-Hinweis.
     work_dir überschreibt das Arbeitsverzeichnis (für Projekt-Routing).
     inbox_dir/outbox_dir überschreiben die Datei-Pfade im System-Prompt.
     aufgabe_filter: Aufgaben-ID für dialog.jsonl-Filterung (z.B. 'A39').
-    root_id: Mattermost-Thread-Root-ID für Zusammenfassung & Reseed.
+    root_id: Mattermost-Thread-Root-ID (für Reseed bei Schicht-2).
+    on_session(sid): wird einmalig gefeuert sobald Claude die Session-ID meldet.
 
     Kontext-Management:
-    - Schicht 1 (vorbeugend): ist das Session-Transkript > CTX_LIMIT_BYTES, wird vor
-      dem Reset eine Zusammenfassung generiert (root_id nötig), dann frisch gestartet.
     - Schicht 2 (Notfall): meldet ein Resume-Lauf 'prompt too long', wird die Session
       zurueckgesetzt, ein Kurz-Kontext vorangestellt und EINMAL neu versucht.
     Gibt (reply_text, outbox_files) zurueck."""
@@ -523,28 +525,8 @@ def run_stream(channel, user_text, incoming_files=None, on_progress=None, on_sta
         if mem:
             prompt = mem + "\n\n---\n\n" + prompt
 
-    # Schicht 1 (vorbeugend): zu grosses Transkript -> Zusammenfassung + frisch starten
-    sz = _session_size(d, sid)
-    if sid and sz > CTX_LIMIT_BYTES:
-        log.warning("[%s] Schicht-1: Session zu gross (%.1f MB) — reset + reseed kanal=%s",
-                    MACHINE, sz / 1_000_000, channel)
-        # Zusammenfassung generieren BEVOR die Session gelöscht wird
-        if root_id:
-            _say("🔍 Erstelle Kontext-Zusammenfassung vor Session-Reset …")
-            summary = _generate_summary(d, channel, sid)
-            if summary:
-                _save_summary(d, root_id, summary)
-                log.info("[%s] Zusammenfassung gespeichert root=%s…", MACHINE, root_id[:8])
-        _say(f"♻️ Session war gross ({sz/1_000_000:.1f} MB) — frisch gestartet "
-             f"mit Kontext-Zusammenfassung.")
-        _save_session(d, channel, None)
-        prompt = _reseed_prefix(d, channel, aufgabe_filter=aufgabe_filter,
-                                root_id=root_id) + "\n\n---\n\n" + prompt
-        resuming = False
-        session_resets += 1
-
     reply, outfiles = _run_once(channel, d, prompt, on_progress, on_start,
-                                extra_append, _inbox, _outbox)
+                                extra_append, _inbox, _outbox, on_session=on_session)
 
     # Schicht 2 (Notfall): Resume trotzdem ins Limit gelaufen -> Reset + Reseed + 1x Retry
     if resuming and _looks_too_long(reply):
@@ -556,7 +538,7 @@ def run_stream(channel, user_text, incoming_files=None, on_progress=None, on_sta
         retry_prompt = _reseed_prefix(d, channel, aufgabe_filter=aufgabe_filter,
                                       root_id=root_id) + "\n\n---\n\n" + prompt
         reply, outfiles = _run_once(channel, d, retry_prompt, on_progress, on_start,
-                                    extra_append, _inbox, _outbox)
+                                    extra_append, _inbox, _outbox, on_session=on_session)
         session_resets += 1
 
     # Schicht 3: Keine Textantwort -> Session zuruecksetzen + frisch nachfragen
@@ -569,7 +551,7 @@ def run_stream(channel, user_text, incoming_files=None, on_progress=None, on_sta
             channel, d,
             "Fasse in 1-2 Saetzen auf Deutsch zusammen was du fuer den User getan hast. "
             "Falls du noch nichts getan hast, beantworte die letzte Anfrage kurz.",
-            on_progress, on_start, extra_append, _inbox, _outbox)
+            on_progress, on_start, extra_append, _inbox, _outbox, on_session=on_session)
         reply = reply2
         outfiles = outfiles or extra_files
 
@@ -584,6 +566,7 @@ def run_stream(channel, user_text, incoming_files=None, on_progress=None, on_sta
         "dauer_s": dauer_total,
         "session_resets": session_resets,
         "machine": MACHINE,
+        "session_id": _load_session(d, channel),
     }
     return (final, outfiles)
 
