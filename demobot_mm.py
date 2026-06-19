@@ -79,43 +79,108 @@ API_BASE = f"{MM_SCHEME}://{MM_URL}/api/v4"
 AUTH_H = {"Authorization": "Bearer " + MM_TOKEN}
 DEMOBOT_DIR = core.dir_for(CHANNEL_NAME)
 
-# Session-Recovery via SSH → MM-Postgres
-MM_SSH_HOST = os.environ.get("MM_SSH_HOST", MM_URL)
-MM_SSH_USER = os.environ.get("MM_SSH_USER", "root")
-MM_SSH_KEY  = os.environ.get("MM_SSH_KEY",
-    r"C:\Users\Lenovo T460p\.ssh\id_rsa_gpubox")
-MM_PG_CONTAINER = os.environ.get("MM_PG_CONTAINER", "mattermost-postgres-1")
-MM_PG_DB    = os.environ.get("MM_PG_DB",   "mattermost")
-MM_PG_USER  = os.environ.get("MM_PG_USER", "mmuser")
-
-_SES_RE = re.compile(r'ses:([a-f0-9][a-f0-9-]{7,})')
+_SES_RE = re.compile(r'ses:([a-f0-9][a-f0-9-]{35,})')
 
 
-def _recover_session_from_mm(session_key, work_dir, thread_root_id, channel_id):
-    """SSH zu MM-Host → psql → letzte 20 Posts im Thread → ses:xxx parsen → resume."""
-    if not thread_root_id or not channel_id:
+def _recover_session_via_api(session_key, work_dir, channel_id, root_id=None):
+    """MM REST API → letzte Posts im Thread/Kanal → ses:xxx aus Bot-Nachrichten → resume.
+    Kein SSH, kein psql. Funktioniert immer wenn MM erreichbar ist."""
+    if not channel_id:
         return None
-    sql = (f"SELECT message FROM posts WHERE channel_id='{channel_id}' "
-           f"AND root_id='{thread_root_id}' ORDER BY create_at DESC LIMIT 20;")
-    cmd = ["ssh",
-           "-i", MM_SSH_KEY,
-           "-o", "StrictHostKeyChecking=no",
-           "-o", "ConnectTimeout=10",
-           "-o", "BatchMode=yes",
-           f"{MM_SSH_USER}@{MM_SSH_HOST}",
-           f"docker exec {MM_PG_CONTAINER} psql -U {MM_PG_USER} -d {MM_PG_DB} -t -c \"{sql}\""]
     try:
-        r = __import__("subprocess").run(cmd, capture_output=True, text=True, timeout=20)
-        m = _SES_RE.search(r.stdout + r.stderr)
-        if m:
-            sid = m.group(1)
-            core._save_session(work_dir, session_key, sid)
-            log.info("[demobot] Session recovered from MM DB: %s (thread %s…)",
-                     sid[:8], thread_root_id[:8])
-            return sid
+        if root_id:
+            r = requests.get(f"{API_BASE}/posts/{root_id}/thread",
+                             headers=AUTH_H, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            posts = sorted((data.get("posts") or {}).values(),
+                           key=lambda p: p.get("create_at", 0), reverse=True)
+        else:
+            r = requests.get(f"{API_BASE}/channels/{channel_id}/posts",
+                             params={"page": 0, "per_page": 50},
+                             headers=AUTH_H, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            order = data.get("order") or []
+            posts_map = data.get("posts") or {}
+            posts = [posts_map[pid] for pid in order if pid in posts_map]
+        bot_id = BOT_USER_ID or ""
+        for post in posts:
+            if post.get("user_id") != bot_id:
+                continue
+            msg = post.get("message") or ""
+            m = _SES_RE.search(msg)
+            if m:
+                sid = m.group(1)
+                core._save_session(work_dir, session_key, sid)
+                log.info("[demobot] Session via API recovered: %s", sid[:8])
+                return sid
     except Exception as e:
-        log.warning("[demobot] Session-Recovery fehlgeschlagen: %s", e)
+        log.warning("[demobot] API-Recovery fehlgeschlagen: %s", e)
     return None
+
+
+def _fetch_thread_context(root_id, limit=20):
+    """Letzte N Posts aus MM-Thread via API holen → kompakter Kontext-Block."""
+    if not root_id:
+        return ""
+    try:
+        r = requests.get(f"{API_BASE}/posts/{root_id}/thread",
+                         headers=AUTH_H, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        posts = list((data.get("posts") or {}).values())
+        posts.sort(key=lambda p: p.get("create_at", 0))
+        posts = posts[-limit:]
+        lines = []
+        for p in posts:
+            uid = p.get("user_id", "")
+            name = data.get("users", {}).get(uid, {}).get("username") or uid[:6]
+            msg = (p.get("message") or "").strip()
+            if msg:
+                lines.append(f"  [{name}]: {msg[:300]}")
+        if not lines:
+            return ""
+        return ("[System: Letzter Thread-Kontext aus Mattermost (letzte 20 Nachrichten):\n"
+                + "\n".join(lines)
+                + "\nKnüpfe daran an.]")
+    except Exception as e:
+        log.debug("Thread-Kontext laden fehlgeschlagen: %s", e)
+        return ""
+
+
+def _fetch_channel_context(channel_id, limit=20):
+    """Letzte N Posts im Kanal → kompakter Kontext-Block für neue Sessions."""
+    if not channel_id:
+        return ""
+    try:
+        r = requests.get(f"{API_BASE}/channels/{channel_id}/posts",
+                         params={"page": 0, "per_page": limit},
+                         headers=AUTH_H, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        order = data.get("order") or []
+        posts_map = data.get("posts") or {}
+        posts = [posts_map[pid] for pid in order if pid in posts_map]
+        posts.sort(key=lambda p: p.get("create_at", 0))
+        lines = []
+        for p in posts:
+            uid = p.get("user_id", "")
+            name = (p.get("props", {}).get("override_username")
+                    or data.get("users", {}).get(uid, {}).get("username")
+                    or uid[:6])
+            msg = (p.get("message") or "").strip()
+            if msg and not msg.startswith("▶️") and not msg.startswith("✅"):
+                lines.append(f"  [{name}]: {msg[:300]}")
+        if not lines:
+            return ""
+        return ("[System: Letzter Kanal-Kontext (letzte Nachrichten):\n"
+                + "\n".join(lines[-limit:])
+                + "\nKnüpfe daran an falls relevant.]")
+    except Exception as e:
+        log.debug("Kanal-Kontext laden fehlgeschlagen: %s", e)
+        return ""
+
 
 _channel_type_cache = {}  # channel_id -> 'O'/'P'/'D'/'G'
 
@@ -647,7 +712,7 @@ def _render_live(tk):
     spin = f" `{tk.get('spinner', '')}`" if tk["status"] == "läuft" else ""
     num = tk.get("label_num") or f"#{tk['id']}"
     sid = tk.get("session_id")
-    ses = (f" `ses:{sid[:8]}`" if sid else "")
+    ses = (f" `ses:{sid}`" if sid else "")
     head = f"{icon} **{num}**{tk.get('label', '')}{spin}{ses} {tk['status']} — _{tk['title']}_"
     steps = tk["steps"][-8:]
     return head + ("\n" + "\n".join(steps) if steps else "")
@@ -817,12 +882,23 @@ def _process(text, files, sender="user", aufgabe_id=None, reply_channel_id=None)
         try:
             aufgabe_filter = f"A{aufgabe_id}" if aufgabe_id else None
             root_id_val = (a or {}).get("root_id") or None
-            # Session-Recovery: kein lokaler Store → MM-DB befragen
-            if not core._load_session(work_dir, session_key) and root_id_val:
-                _recover_session_from_mm(session_key, work_dir,
-                                         root_id_val, reply_channel_id or MM_CHANNEL_ID)
+            # Session-Recovery: kein lokaler Store → MM API durchsuchen (ses:xxx aus Bot-Posts)
+            cid = reply_channel_id or MM_CHANNEL_ID
+            existing_sid = core._load_session(work_dir, session_key)
+            if not existing_sid:
+                existing_sid = _recover_session_via_api(session_key, work_dir,
+                                                         cid, root_id=root_id_val)
+            # Kontext injizieren wenn Session fehlt oder Transcript frisch/klein
+            ctx_extra = ""
+            sess_size = core._session_size(work_dir, existing_sid) if existing_sid else 0
+            if sess_size < 150_000:
+                if root_id_val:
+                    ctx_extra = _fetch_thread_context(root_id_val)
+                if not ctx_extra:
+                    ctx_extra = _fetch_channel_context(cid)
             reply, outfiles = core.run_stream(
-                session_key, text, files,
+                session_key, text if not ctx_extra else ctx_extra + "\n\n---\n\n" + text,
+                files,
                 on_progress=on_progress, on_start=on_start,
                 on_notice=lambda m: _post_text(m, reply_channel_id, thread_root),
                 work_dir=work_dir, inbox_dir=INBOX, outbox_dir=OUTBOX,
@@ -853,7 +929,7 @@ def _process(text, files, sender="user", aufgabe_id=None, reply_channel_id=None)
                         _post_text(_cmd_vorgang(sw_name), reply_channel_id, thread_root)
                 reply = "\n".join(reply_lines[1:]).strip()
             ses_fin = tk.get("session_id") or meta.get("session_id")
-            ses_tag = (f" `ses:{ses_fin[:8]}`" if ses_fin else "")
+            ses_tag = (f" `ses:{ses_fin}`" if ses_fin else "")
             _patch(tk["post_id"], f"✅ **{label_num}**{label}{ses_tag} — _{title}_\n\n{(reply or '')[:15000]}")
             if aufgabe_id:
                 _update_aufgaben_post(aufgabe_id, "DONE", preview=reply)
