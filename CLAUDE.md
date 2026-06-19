@@ -52,6 +52,25 @@ Danach dem User KURZ bestätigen: **„Notiert ✅ — ich melde mich im Kanal, 
 - Sag knapp, was du getan hast. Keine langen Erklärungen.
 - Wenn du eine Datei nach `_outbox\` gelegt hast, erwähne das kurz.
 
+## GO-Gate — Implementierung braucht explizites GO <!-- v1.0 | 2026-06-18 -->
+
+> Gilt für alle Aufgaben. Besonders wichtig bei Spracheingabe (Handy-Diktat).
+
+**Sammel-Regel:** Wenn mehrere Nachrichten in kurzer Folge kommen (Spracheingabe, mehrteilige Erklärung) → erst alles sammeln, nicht nach jeder Nachricht reagieren. Erst wenn der Input-Strom abreißt: strukturierten Plan ausgeben, dann auf GO warten.
+
+**Was ohne GO sofort erlaubt ist:**
+- Dateien lesen, Strukturen verstehen, Infos nachschlagen
+- Planen, Analysieren, Zusammenfassen, Konzepte erklären
+
+**Was NIEMALS ohne explizites GO passiert:**
+- Code schreiben oder Dateien ändern
+- Scripts ausführen die Daten verändern
+- Dienste starten/stoppen/deployen
+
+**Was ist GO:** Explizites "GO", "ja mach", "mach es" — nichts anderes.
+**Was ist kein GO:** Eine Beschreibung, "klingt gut", Schweigen.
+**STOP:** Sofort unterbrechen, Status ausgeben, warten.
+
 ---
 
 # [DEV] Entwicklung & Wartung
@@ -67,16 +86,15 @@ Danach dem User KURZ bestätigen: **„Notiert ✅ — ich melde mich im Kanal, 
 
 ```
 LAPTOP (PC-WLPT)                          VPS (hetzner-vps)
-  demobot  → #demobot   (Instanz 1)         Mattermost (mm.salows.de)
-  demobot2 → #demobot2  (Instanz 2)         villa-manager  (/opt/villa131/)
-  demobot3 → #demobot3  (Instanz 3)         priv-inventar  (/opt/priv-inventar-bot/)
+  demobot  → #demobot      (primär)         Mattermost (mm.salows.de)
+  demobot  → #mailcenter   (zweiter Kanal)  villa-manager  (/opt/villa131/)
+                                            priv-inventar  (/opt/priv-inventar-bot/)
                                             fahrkartenbot  (/opt/fahrkartenbot/)
   Code: c:\projekte\demobot\demobot_mm.py
-        c:\projekte\demobot\demobot_core.py   ← EIN Code, 3x gestartet
-  State: je eigenes Verzeichnis (demobot/, demobot2/, demobot3/)
+        c:\projekte\demobot\demobot_core.py
 ```
 
-- **Ein Fix in `demobot/` gilt für alle drei Instanzen.**
+- **demobot2 + demobot3 wurden entfernt (2026-06-17)** — nur noch eine Instanz.
 - Details: `docs/ARCHITEKTUR.md`
 
 ## Hintergrunddienste (Laptop)
@@ -113,3 +131,4 @@ LAPTOP (PC-WLPT)                          VPS (hetzner-vps)
 - Änderungen an `demobot_core.py` / `demobot_mm.py` → immer `start_all.ps1` danach
 - Neue Cron-Jobs oder Tasks → in `docs/ARCHITEKTUR.md` Abschnitt "Hintergrunddienste" eintragen
 - Debugging: erst Log, dann Annahmen — nie raten
+- **GO-Gate:** Schritt 0 vor jedem Plan — QMD lookup (`python C:\projekte\qmd\qmd_search.py demobot`) + diese CLAUDE.md + Logs. Dann Plan → GO abwarten → erst dann Code anfassen.

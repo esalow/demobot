@@ -64,6 +64,8 @@ log = logging.getLogger("demobot-mm")
 MM_URL = os.environ["MM_URL"]
 MM_TOKEN = os.environ["MM_TOKEN"]
 MM_CHANNEL_ID = os.environ["MM_CHANNEL_ID_DEMOBOT"]
+MM_CHANNEL_ID_MAILCENTER = os.environ.get("MM_CHANNEL_ID_MAILCENTER", "")
+ALLOWED_CHANNEL_IDS = {MM_CHANNEL_ID} | ({MM_CHANNEL_ID_MAILCENTER} if MM_CHANNEL_ID_MAILCENTER else set())
 MM_SCHEME = os.environ.get("MM_SCHEME", "https")
 MM_PORT = int(os.environ.get("MM_PORT", "443"))
 MM_OWNER = os.environ.get("MM_OWNER_USER_ID", "")
@@ -1159,9 +1161,9 @@ async def event_handler(message):
     channel_id = post.get("channel_id", "")
     user_id = post.get("user_id", "")
 
-    # Hauptkanal oder DM-Kanal vom Owner
-    if channel_id == MM_CHANNEL_ID:
-        reply_channel_id = None  # Default → Hauptkanal
+    # Erlaubte Kanäle oder DM-Kanal vom Owner
+    if channel_id in ALLOWED_CHANNEL_IDS:
+        reply_channel_id = channel_id if channel_id != MM_CHANNEL_ID else None
     else:
         if MM_OWNER and user_id != MM_OWNER:
             return
