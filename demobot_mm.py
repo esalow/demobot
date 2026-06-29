@@ -94,6 +94,29 @@ except Exception:
     pass
 
 
+def _get_claude_pfad(work_dir: str) -> str:
+    """Vom work_dir aufsteigend alle CLAUDE.md Verzeichnisse sammeln → 'global · proj · sub'."""
+    home = os.path.expanduser("~")
+    parts = []
+    if os.path.isfile(os.path.join(home, ".claude", "CLAUDE.md")):
+        parts.append("global")
+    dirs_found = []
+    path = os.path.realpath(work_dir) if work_dir and os.path.isdir(work_dir) else ""
+    seen: set = set()
+    while path and path not in seen:
+        seen.add(path)
+        if os.path.isfile(os.path.join(path, "CLAUDE.md")):
+            dirs_found.append(path)
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
+    for p in reversed(dirs_found):
+        name = os.path.basename(p) or p
+        parts.append(name)
+    return " · ".join(parts) if parts else ""
+
+
 def _recover_session_via_api(session_key, work_dir, channel_id, root_id=None):
     """MM REST API → letzte Posts im Thread/Kanal → ses:xxx aus Bot-Nachrichten → resume.
     Kein SSH, kein psql. Funktioniert immer wenn MM erreichbar ist."""
@@ -661,31 +684,31 @@ def _create_post(msg, channel_id=None, root_id=None):
 # ── Thread-Topic ──────────────────────────────────────────────────────────────
 
 def _set_thread_topic(root_id: str, topic: str, channel_id: str = "") -> str:
-    """### Titel ### als Prefix in den ersten Bot-Reply im Thread schreiben.
-    Existiert bereits ein ### ... ### Prefix → an Position 0 ersetzen.
+    """### Titel ### als Prefix auf den Aufgaben-Hauptpost im Channel setzen.
+    Topic wird in _aufgaben gespeichert und bei jedem _update_aufgaben_post erhalten.
     """
     try:
-        r = requests.get(f"{API_BASE}/posts/{root_id}/thread", headers=AUTH_H, timeout=10)
+        aid = _aufgabe_by_root(root_id)
+        pid = None
+        if aid:
+            with _aufgaben_lock:
+                pid = _aufgaben.get(aid, {}).get("main_post_id")
+        if not pid:
+            return "❌ Kein Aufgaben-Post gefunden — erst eine Frage stellen."
+        with _aufgaben_lock:
+            if aid in _aufgaben:
+                _aufgaben[aid]["topic"] = topic
+        _save_aufgaben()
+        r = requests.get(f"{API_BASE}/posts/{pid}", headers=AUTH_H, timeout=10)
         r.raise_for_status()
-        posts = sorted((r.json().get("posts") or {}).values(),
-                       key=lambda p: p.get("create_at", 0))
-        first_bot = None
-        for p in posts:
-            if p.get("user_id") == BOT_USER_ID:
-                if p.get("id") == root_id or p.get("root_id") == root_id:
-                    first_bot = p
-                    break
-        if not first_bot:
-            return "❌ Kein Bot-Post im Thread gefunden — erst eine Frage stellen."
-        pid  = first_bot["id"]
-        body = (first_bot.get("message") or "")
+        body = (r.json().get("message") or "")
         if body.startswith("###"):
             end = body.find("###", 3)
             if end != -1:
                 body = body[end + 3:].lstrip("\n")
-        new_msg = f"### {topic} ###\n\n{body}"
         requests.put(f"{API_BASE}/posts/{pid}", headers=AUTH_H,
-                     json={"id": pid, "message": new_msg}, timeout=10).raise_for_status()
+                     json={"id": pid, "message": f"### {topic} ###\n\n{body}"},
+                     timeout=10).raise_for_status()
         return f"📌 `{topic}` gesetzt."
     except Exception as e:
         return f"❌ Topic setzen fehlgeschlagen: {e}"
@@ -799,10 +822,12 @@ def _open_aufgabe(title, work_dir=None, name=None, root_id=None):
     with _aufgaben_lock:
         _aufgabe_seq[0] += 1
         aid = _aufgabe_seq[0]
+        _wdir = work_dir or active["dir"]
         _aufgaben[aid] = {"id": aid, "title": title[:50],
                           "session_key": f"mm_{root_id}" if root_id else f"{CHANNEL_NAME}_A{aid}",
                           "status": "aktiv",
-                          "dir": work_dir or active["dir"],
+                          "dir": _wdir,
+                          "claude_pfad": _get_claude_pfad(_wdir),
                           "name": name or active["name"],
                           "root_id": root_id,
                           "sub_seq": 0,
@@ -830,9 +855,20 @@ def _update_aufgaben_post(aufgabe_id, status, preview=None):
     antworten = f"{sub} Antwort{'en' if sub != 1 else ''}"
     laufend = f"läuft #{aufgabe_id}.{sub}" if status == "AKTUELL" else antworten
     text = f"{icon} **#{aufgabe_id}** [{proj}] **{status}** — {laufend}"
+    wdir = a.get("dir", "")
+    cpfad = a.get("claude_pfad", "")
+    if wdir or cpfad:
+        wdir_s  = f"📂 `{os.path.basename(wdir)}`" if wdir else ""
+        cpfad_s = f"🧠 {cpfad}" if cpfad else ""
+        meta = "  ".join(x for x in [wdir_s, cpfad_s] if x)
+        if meta:
+            text += f"\n{meta}"
     if preview and status == "DONE":
         kurz = preview[:120].replace("\n", " ")
         text += f"\n   ↳ _{kurz}_"
+    topic = a.get("topic", "")
+    if topic:
+        text = f"### {topic} ###\n\n{text}"
     with _aufgaben_lock:
         post_id = _aufgaben.get(aufgabe_id, {}).get("main_post_id")
     if post_id:
@@ -996,7 +1032,9 @@ def _process(text, files, sender="user", aufgabe_id=None, reply_channel_id=None)
             ses_tag = (f" `ses:{ses_fin}`" if ses_fin else "")
             wdir_fin = tk.get("work_dir", "")
             wdir_foot = f" · `📂 {os.path.basename(wdir_fin)}`" if wdir_fin else ""
-            footer = f"\n\n`ses:{ses_fin}` · `bot-core {_BOTCORE_VERSION}`{wdir_foot}" if ses_fin else ""
+            cpfad = (_get_aufgabe(aufgabe_id) or {}).get("claude_pfad", "") if aufgabe_id else _get_claude_pfad(work_dir)
+            brain_tag = f" · 🧠 {cpfad}" if cpfad else ""
+            footer = f"\n\n`ses:{ses_fin}` · `bot-core {_BOTCORE_VERSION}`{wdir_foot}{brain_tag}" if ses_fin else ""
             _patch(tk["post_id"], f"✅ **{label_num}**{label}{ses_tag} — _{title}_\n\n{(reply or '')[:15000]}{footer}")
             if aufgabe_id:
                 _update_aufgaben_post(aufgabe_id, "DONE", preview=reply)
@@ -1243,18 +1281,21 @@ def _flush_debounce(key):
     low = merged_text.lower().strip()
 
     # "resume <uuid>" → Session explizit binden (z.B. von Laptop-VSCode-Session)
-    _res_m = re.match(r'^resume\s+([a-f0-9][a-f0-9-]{35,})$', low)
+    _res_m = re.match(r'^resume\s+([a-f0-9][a-f0-9-]{35,})', low)
     if _res_m:
         sid = _res_m.group(1)
         work_dir = core.dir_for(CHANNEL_NAME)
         session_key = f"explicit_{sid[:8]}"
         core._save_session(work_dir, session_key, sid)
-        aid = _open_aufgabe(f"Explicit-Resume ses:{sid[:8]}", root_id=None)
+        # Bestehende Aufgabe updaten statt neue aufmachen
+        aid = _aufgabe_by_root(root_id) if root_id else None
+        if not aid:
+            aid = _open_aufgabe(f"Resume ses:{sid[:8]}", root_id=root_id)
         with _aufgaben_lock:
             if aid in _aufgaben:
                 _aufgaben[aid]["session_key"] = session_key
         _save_aufgaben()
-        _post_text(f"▶️ Session `ses:{sid[:12]}` gebunden — schreib deine nächste Nachricht.", rcid)
+        _post_text(f"▶️ Session `ses:{sid[:12]}` gebunden — nächste Nachricht läuft damit.", rcid)
         return
 
     # "zurueck" / "was laeuft" / "aufgaben" → Liste zeigen, auf Auswahl warten
