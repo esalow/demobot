@@ -22,6 +22,7 @@ import logging
 import threading
 import datetime
 from datetime import timezone
+from pathlib import Path
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -687,21 +688,29 @@ def _generate_topic(user_text: str, claude_reply: str, work_dir: str) -> str:
         return f"Aufgabe | {proj}"
 
 
-def _set_thread_topic(root_id: str, topic: str) -> str:
-    """Root-Post des Threads mit 🔖-Prefix patchen."""
+_topic_post_ids: dict = {}  # root_id → bot-eigene Topic-Post-ID
+
+
+def _set_thread_topic(root_id: str, topic: str, channel_id: str = "") -> str:
+    """Bot-eigenen 🔖-Post im Thread setzen oder updaten (kein fremder Post nötig)."""
+    msg = f"🔖 **{topic}**"
     try:
-        r = requests.get(f"{API_BASE}/posts/{root_id}", headers=AUTH_H, timeout=10)
-        r.raise_for_status()
-        orig = r.json().get("message", "")
-        if orig.startswith("🔖"):
-            first_nl = orig.find("\n")
-            rest = orig[first_nl:] if first_nl != -1 else ""
-            new_msg = f"🔖 {topic}{rest}"
+        existing_id = _topic_post_ids.get(root_id)
+        if not existing_id:
+            r = requests.get(f"{API_BASE}/posts/{root_id}/thread", headers=AUTH_H, timeout=10)
+            r.raise_for_status()
+            for p in (r.json().get("posts") or {}).values():
+                if p.get("user_id") == BOT_USER_ID and (p.get("message") or "").startswith("🔖"):
+                    existing_id = p["id"]
+                    _topic_post_ids[root_id] = existing_id
+                    break
+        if existing_id:
+            requests.put(f"{API_BASE}/posts/{existing_id}", headers=AUTH_H,
+                         json={"id": existing_id, "message": msg}, timeout=10).raise_for_status()
         else:
-            new_msg = f"🔖 {topic}\n\n{orig}" if orig else f"🔖 {topic}"
-        r2 = requests.put(f"{API_BASE}/posts/{root_id}", headers=AUTH_H,
-                          json={"id": root_id, "message": new_msg[:16000]}, timeout=10)
-        r2.raise_for_status()
+            cid = channel_id or MM_CHANNEL_ID
+            p = _create_post(msg, cid, root_id=root_id)
+            _topic_post_ids[root_id] = p.get("id", "")
         return f"🔖 `{topic}` gesetzt."
     except Exception as e:
         return f"❌ Topic setzen fehlgeschlagen: {e}"
