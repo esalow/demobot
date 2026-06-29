@@ -671,9 +671,10 @@ def _set_thread_topic(root_id: str, topic: str, channel_id: str = "") -> str:
                        key=lambda p: p.get("create_at", 0))
         first_bot = None
         for p in posts:
-            if p.get("user_id") == BOT_USER_ID and p.get("root_id") == root_id:
-                first_bot = p
-                break
+            if p.get("user_id") == BOT_USER_ID:
+                if p.get("id") == root_id or p.get("root_id") == root_id:
+                    first_bot = p
+                    break
         if not first_bot:
             return "❌ Kein Bot-Post im Thread gefunden — erst eine Frage stellen."
         pid  = first_bot["id"]
