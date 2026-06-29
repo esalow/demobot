@@ -86,6 +86,22 @@ API_BASE = f"{MM_SCHEME}://{MM_URL}/api/v4"
 AUTH_H = {"Authorization": "Bearer " + MM_TOKEN}
 DEMOBOT_DIR = core.dir_for(CHANNEL_NAME)
 
+# Kanal → Standard-Verzeichnis: jeder Kanal hat sein festes Projekt
+# Neue Aufgaben in einem Kanal starten immer im kanal-eigenen Verzeichnis.
+# In-Thread SWITCH ändert nur die Aufgabe, NICHT dieses Mapping.
+_CHANNEL_DIR_MAP: dict = {}
+if MM_CHANNEL_ID:
+    _CHANNEL_DIR_MAP[MM_CHANNEL_ID] = DEMOBOT_DIR
+if MM_CHANNEL_ID_MAILCENTER:
+    _mc_dir = os.environ.get("MM_CHANNEL_DIR_MAILCENTER",
+                             os.path.join(os.path.dirname(DEMOBOT_DIR), "mailcenter"))
+    _CHANNEL_DIR_MAP[MM_CHANNEL_ID_MAILCENTER] = _mc_dir
+
+
+def _channel_default_dir(channel_id: str) -> str:
+    """Gibt das Standard-Verzeichnis für einen Kanal zurück."""
+    return _CHANNEL_DIR_MAP.get(channel_id or "", _get_active()["dir"])
+
 _BOTCORE_VERSION = "?"
 try:
     _vc = os.path.join(os.path.dirname(__file__), "..", "bot-core", "VERSION")
@@ -817,18 +833,21 @@ def _list_tasks():
     return "\n".join(lines)
 
 
-def _open_aufgabe(title, work_dir=None, name=None, root_id=None):
+def _open_aufgabe(title, work_dir=None, name=None, root_id=None, channel_id=None):
     active = _get_active()
+    # Kanal-Standard-Verzeichnis hat Vorrang vor globalem _active (kein Channel-Kreuzkontaminierung)
+    channel_dir = _channel_default_dir(channel_id) if channel_id else None
     with _aufgaben_lock:
         _aufgabe_seq[0] += 1
         aid = _aufgabe_seq[0]
-        _wdir = work_dir or active["dir"]
+        _wdir = work_dir or channel_dir or active["dir"]
+        _wname = name or (os.path.basename(_wdir) if channel_dir else active["name"])
         _aufgaben[aid] = {"id": aid, "title": title[:50],
                           "session_key": f"mm_{root_id}" if root_id else f"{CHANNEL_NAME}_A{aid}",
                           "status": "aktiv",
                           "dir": _wdir,
                           "claude_pfad": _get_claude_pfad(_wdir),
-                          "name": name or active["name"],
+                          "name": _wname,
                           "root_id": root_id,
                           "sub_seq": 0,
                           "main_post_id": None}
@@ -1019,15 +1038,14 @@ def _process(text, files, sender="user", aufgabe_id=None, reply_channel_id=None)
             tk["status"] = "fertig"
             # SWITCH-Signal auswerten (erste Zeile der Antwort)
             reply_lines = (reply or "").splitlines()
+            # SWITCH-Signal ignorieren — Konzept: Kanal = Kontext, kein In-Thread-Switch
             if reply_lines and reply_lines[0].startswith("SWITCH:"):
-                parts = reply_lines[0].strip().split(":")
-                if len(parts) == 3:
-                    sw_typ, sw_name = parts[1], parts[2].strip()
-                    if sw_typ == "projekt":
-                        _post_text(_cmd_projekt(sw_name), reply_channel_id, thread_root)
-                    elif sw_typ == "vorgang":
-                        _post_text(_cmd_vorgang(sw_name), reply_channel_id, thread_root)
                 reply = "\n".join(reply_lines[1:]).strip()
+            # claude_pfad nachholen falls Aufgabe vor dem Update erstellt wurde
+            if aufgabe_id:
+                with _aufgaben_lock:
+                    if aufgabe_id in _aufgaben and not _aufgaben[aufgabe_id].get("claude_pfad"):
+                        _aufgaben[aufgabe_id]["claude_pfad"] = _get_claude_pfad(work_dir)
             ses_fin = tk.get("session_id") or meta.get("session_id")
             ses_tag = (f" `ses:{ses_fin}`" if ses_fin else "")
             wdir_fin = tk.get("work_dir", "")
@@ -1361,7 +1379,8 @@ def _flush_debounce(key):
     if m:
         after = merged_text[m.end():].strip().lstrip(":- ").strip()
         title = after.splitlines()[0][:50] if after else "Neue Aufgabe"
-        aid = _open_aufgabe(title, root_id=merged_post.get("id"))
+        _ch = merged_post.get("channel_id", "")
+        aid = _open_aufgabe(title, root_id=merged_post.get("id"), channel_id=_ch)
         _post_text(f"📋 **A{aid}** eroeffnet — _{title}_", rcid, merged_post.get("id"))
         _update_aufgaben_post(aid, "QUEUED")
         if after:
@@ -1372,7 +1391,8 @@ def _flush_debounce(key):
     # Normal: Top-Level-Hauptkanal → immer neue Aufgabe (eigener Thread pro Thema).
     # Thread-Antworten (root_id gesetzt) wurden oben schon abgefangen.
     title = merged_text.splitlines()[0][:50] if merged_text else "Aufgabe"
-    aid = _open_aufgabe(title, root_id=merged_post.get("id"))
+    _ch = merged_post.get("channel_id", "")
+    aid = _open_aufgabe(title, root_id=merged_post.get("id"), channel_id=_ch)
     _update_aufgaben_post(aid, "QUEUED")
     threading.Thread(target=_run_task, args=(merged_post, sender_name, aid), kwargs={"reply_channel_id": rcid}, daemon=True).start()
 
@@ -1467,6 +1487,54 @@ async def event_handler(message):
         _wd = _get_active()["dir"]
         _exists = "✅" if os.path.isdir(_wd) else "❌ existiert nicht"
         _post_text(f"📂 `{_wd}` {_exists}", _rcid, _thread)
+        return
+
+    # /reset — Session im aktuellen Thread löschen → nächste Nachricht startet frisch
+    if _low_msg in {"/reset", "/neu", "/new", "/fresh"}:
+        _thread_root = _thread or post.get("id", "")
+        aid = _aufgabe_by_root(_thread_root)
+        if aid:
+            with _aufgaben_lock:
+                _a = _aufgaben.get(aid, {})
+                _old_dir = _a.get("dir", "")
+                _old_sk = _a.get("session_key", "")
+            try:
+                core._save_session(_old_dir, _old_sk, None)
+            except Exception:
+                pass
+            _post_text("🔄 Session zurückgesetzt — nächste Nachricht startet frisch im aktuellen Verzeichnis.", _rcid, _thread)
+        else:
+            _post_text("ℹ️ Kein aktiver Thread gefunden.", _rcid, _thread)
+        return
+
+    # "geh ins X" / "wechsle zu X" — Kanal-Hinweis statt In-Thread-Switch
+    # Konzept: Kanal = Kontext. Projektwechsel = Kanalwechsel.
+    _sw_m = re.match(r'^(?:geh(?:e?)?\s+(?:ins?|zu(?:m?)?|in)\s+|wechsel(?:e?|n)?\s+(?:zu(?:m?)?|in(?:s?)?)\s+)(.+)$', _low_msg)
+    if _sw_m:
+        _sw_name = _sw_m.group(1).strip()
+        _post_text(
+            f"➡️ Für **{_sw_name}** einfach in den `#{_sw_name}` Kanal wechseln — "
+            f"jeder Kanal hat seinen eigenen Kontext.",
+            _rcid, _thread)
+        return
+
+    if _low_msg in {"help", "hilfe", "/help", "/hilfe", "?", "/?"}:
+        _post_text(
+            "**demobot** — Befehle:\n"
+            "```\n"
+            "/projekt <name>     Projekt wechseln (z.B. /projekt mailcenter)\n"
+            "/vorgang <name>     Vorgang aktivieren\n"
+            "/home               Zurück zu demobot-Standard\n"
+            "cwd / pwd           Aktuelles Verzeichnis\n"
+            "status              Laufende Aufgaben\n"
+            "stop #N             Aufgabe N abbrechen\n"
+            "set topic <Text>    Thread-Titel setzen\n"
+            "resume <uuid>       Session manuell binden\n"
+            "/deploy             Code-Update (git pull)\n"
+            "```\n"
+            f"Aktives Verzeichnis: `{_get_active()['dir']}`",
+            _rcid, _thread
+        )
         return
 
     # "set topic <Text>" — manuell, direkt als ### Text ### Prefix in ersten Bot-Reply
