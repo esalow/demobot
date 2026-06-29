@@ -32,6 +32,12 @@ except Exception:
 import requests
 import ssl as _ssl
 from dotenv import load_dotenv
+
+# bot-core shared helpers (kein Module-Level-Side-Effect)
+sys.path.insert(0, str(Path(__file__).parent.parent / "bot-core"))
+from bot_mm_helpers import (SES_RE as _SES_RE,
+                             recover_session_from_thread as _bot_recover_session,
+                             fetch_parent_context as _bot_fetch_parent_context)
 from mattermostdriver import Driver
 import mattermostdriver.websocket as _mmws
 
@@ -79,7 +85,15 @@ API_BASE = f"{MM_SCHEME}://{MM_URL}/api/v4"
 AUTH_H = {"Authorization": "Bearer " + MM_TOKEN}
 DEMOBOT_DIR = core.dir_for(CHANNEL_NAME)
 
-_SES_RE = re.compile(r'ses:([a-f0-9][a-f0-9-]{35,})')
+_pending_topics: dict = {}   # root_id → vorgeschlagener Topic-String
+_pending_lock = threading.Lock()
+
+_BOTCORE_VERSION = "?"
+try:
+    _vc = os.path.join(os.path.dirname(__file__), "..", "bot-core", "VERSION")
+    _BOTCORE_VERSION = open(_vc).read().strip().splitlines()[0]
+except Exception:
+    pass
 
 
 def _recover_session_via_api(session_key, work_dir, channel_id, root_id=None):
@@ -646,6 +660,67 @@ def _create_post(msg, channel_id=None, root_id=None):
     raise last_exc
 
 
+# ── Thread-Topic ──────────────────────────────────────────────────────────────
+
+TOPIC_TYPES = ["Recherche", "Implementierung", "Analyse", "Bug", "Planung", "Review"]
+
+
+def _generate_topic(user_text: str, claude_reply: str, work_dir: str) -> str:
+    """Haiku-Schnellaufruf → '[Typ] | [3 Wörter]'."""
+    proj = os.path.basename(work_dir)
+    prompt = (
+        f"Projekt: {proj}. Anfrage: {user_text[:150]}. "
+        f"Antwort-Kurzfassung: {claude_reply[:200]}. "
+        f"Antworte NUR mit einer Zeile: [Typ] | [3 Wörter]. "
+        f"Erlaubte Typen: {', '.join(TOPIC_TYPES)}. "
+        f"Beispiel: Implementierung | demobot Sofort-Befehle"
+    )
+    claude_cmd = os.environ.get("CLAUDE_CMD", "claude")
+    try:
+        res = subprocess.run(
+            [claude_cmd, "-p", prompt, "--model", "claude-haiku-4-5-20251001"],
+            capture_output=True, text=True, timeout=30, encoding="utf-8", errors="replace"
+        )
+        line = (res.stdout or "").strip().splitlines()[0][:60]
+        return line if "|" in line else f"Aufgabe | {proj}"
+    except Exception:
+        return f"Aufgabe | {proj}"
+
+
+def _set_thread_topic(root_id: str, topic: str) -> str:
+    """Root-Post des Threads mit 🔖-Prefix patchen."""
+    try:
+        r = requests.get(f"{API_BASE}/posts/{root_id}", headers=AUTH_H, timeout=10)
+        r.raise_for_status()
+        orig = r.json().get("message", "")
+        if orig.startswith("🔖"):
+            first_nl = orig.find("\n")
+            rest = orig[first_nl:] if first_nl != -1 else ""
+            new_msg = f"🔖 {topic}{rest}"
+        else:
+            new_msg = f"🔖 {topic}\n\n{orig}" if orig else f"🔖 {topic}"
+        r2 = requests.put(f"{API_BASE}/posts/{root_id}", headers=AUTH_H,
+                          json={"id": root_id, "message": new_msg[:16000]}, timeout=10)
+        r2.raise_for_status()
+        return f"🔖 `{topic}` gesetzt."
+    except Exception as e:
+        return f"❌ Topic setzen fehlgeschlagen: {e}"
+
+
+def _do_suggest_topic(root_id: str, user_text: str, claude_reply: str,
+                      work_dir: str, reply_channel_id, thread) -> None:
+    """Im Hintergrund: Topic generieren → Vorschlag in Thread posten."""
+    topic = _generate_topic(user_text, claude_reply, work_dir)
+    with _pending_lock:
+        _pending_topics[root_id] = topic
+    _post_text(
+        f"💡 Vorschlag: `{topic}`\n→ als Thread-Titel setzen?  **ja** · **nein** · oder eigenen Text eingeben",
+        reply_channel_id, thread
+    )
+
+
+# ── Patch ─────────────────────────────────────────────────────────────────────
+
 def _patch(post_id, msg):
     try:
         driver.posts.patch_post(post_id, {"id": post_id, "message": msg[:16000]})
@@ -712,8 +787,14 @@ def _render_live(tk):
     spin = f" `{tk.get('spinner', '')}`" if tk["status"] == "läuft" else ""
     num = tk.get("label_num") or f"#{tk['id']}"
     sid = tk.get("session_id")
-    ses = (f" `ses:{sid}`" if sid else "")
-    head = f"{icon} **{num}**{tk.get('label', '')}{spin}{ses} {tk['status']} — _{tk['title']}_"
+    ses = (f" `ses:{sid[:12]}`" if sid else "")
+    wdir = tk.get("work_dir", "")
+    wdir_tag = f" `📂{os.path.basename(wdir)}`" if wdir else ""
+    elapsed = ""
+    if tk["status"] == "läuft" and tk.get("t_start"):
+        secs = int(time.time() - tk["t_start"])
+        elapsed = f" `{secs//60}m{secs%60:02d}s`" if secs >= 60 else f" `{secs}s`"
+    head = f"{icon} **{num}**{tk.get('label', '')}{spin}{elapsed}{ses}{wdir_tag} {tk['status']} — _{tk['title']}_"
     steps = tk["steps"][-8:]
     return head + ("\n" + "\n".join(steps) if steps else "")
 
@@ -831,6 +912,16 @@ def _process(text, files, sender="user", aufgabe_id=None, reply_channel_id=None)
     work_dir = (a or {}).get("dir") or active["dir"]
     a_name = (a or {}).get("name") or active["name"]
     thread_root = (a or {}).get("root_id")  # Mattermost-Thread der Aufgabe
+
+    # Verzeichnis prüfen — existiert es wirklich?
+    if not os.path.isdir(work_dir):
+        fallback = DEMOBOT_DIR
+        _post_text(f"⚠️ `{work_dir}` existiert nicht — falle zurück auf `{fallback}`",
+                   reply_channel_id, thread_root)
+        log.warning("[demobot] work_dir fehlt: %s → Fallback %s", work_dir, fallback)
+        work_dir = fallback
+        a_name = CHANNEL_NAME
+
     tid = _next_tid()
     session_key = _get_session_key(aufgabe_id)
     proj_label = "" if a_name == CHANNEL_NAME else f" [{a_name}]"
@@ -843,8 +934,9 @@ def _process(text, files, sender="user", aufgabe_id=None, reply_channel_id=None)
                         root_id=thread_root)
     tk = {"id": tid, "title": title, "status": "läuft", "proc": None,
           "post_id": post["id"],
-          "steps": [], "last": 0.0, "session_id": None,
-          "aufgabe_id": aufgabe_id, "label": label, "label_num": label_num}
+          "steps": [], "last": 0.0, "session_id": None, "t_start": time.time(),
+          "aufgabe_id": aufgabe_id, "label": label, "label_num": label_num,
+          "work_dir": work_dir}
     with _task_lock:
         _tasks[tid] = tk
 
@@ -873,7 +965,7 @@ def _process(text, files, sender="user", aufgabe_id=None, reply_channel_id=None)
             while not stop_ev.wait(0.5):
                 t["spinner"] = SPINNER_FRAMES[i % len(SPINNER_FRAMES)]
                 now = time.time()
-                if t["status"] == "läuft" and now - last_patch >= 1.5:
+                if t["status"] == "läuft" and now - last_patch >= 1.0:
                     _patch(t["post_id"], _render_live(t))
                     last_patch = now
                 i += 1
@@ -930,9 +1022,18 @@ def _process(text, files, sender="user", aufgabe_id=None, reply_channel_id=None)
                 reply = "\n".join(reply_lines[1:]).strip()
             ses_fin = tk.get("session_id") or meta.get("session_id")
             ses_tag = (f" `ses:{ses_fin}`" if ses_fin else "")
-            _patch(tk["post_id"], f"✅ **{label_num}**{label}{ses_tag} — _{title}_\n\n{(reply or '')[:15000]}")
+            wdir_fin = tk.get("work_dir", "")
+            wdir_foot = f" · `📂 {os.path.basename(wdir_fin)}`" if wdir_fin else ""
+            footer = f"\n\n`ses:{ses_fin}` · `bot-core {_BOTCORE_VERSION}`{wdir_foot}" if ses_fin else ""
+            _patch(tk["post_id"], f"✅ **{label_num}**{label}{ses_tag} — _{title}_\n\n{(reply or '')[:15000]}{footer}")
             if aufgabe_id:
                 _update_aufgaben_post(aufgabe_id, "DONE", preview=reply)
+            # Auto-Topic nach erster Antwort im Thread (sub == 1)
+            if sub == 1 and thread_root and thread_root not in _pending_topics:
+                threading.Thread(target=_do_suggest_topic,
+                                 args=(thread_root, text, reply or "", wdir_fin,
+                                       reply_channel_id, thread_root),
+                                 daemon=True).start()
             sent = []
             for p in outfiles:
                 try:
@@ -1159,9 +1260,36 @@ def _flush_debounce(key):
             threading.Thread(target=_run_task, args=(merged_post, sender_name, aid),
                              kwargs={"reply_channel_id": rcid}, daemon=True).start()
             return
-        # Thread gehoert zu keiner Aufgabe (fremder Thread) -> normale Logik
+        # Fremder Thread: nach ses:xxx scannen → auto-resume wenn Session gefunden
+        recovered = _recover_session_via_api(
+            session_key=f"mm_{root_id}",
+            work_dir=core.dir_for(CHANNEL_NAME),
+            channel_id=CHANNEL_ID,
+            root_id=root_id,
+        )
+        if recovered:
+            log.info("[demobot] Thread-Resume: ses:%s via root_id %s", recovered[:8], root_id[:8])
+            aid = _open_aufgabe(f"Thread-Resume ses:{recovered[:8]}", root_id=root_id)
+            threading.Thread(target=_run_task, args=(merged_post, sender_name, aid),
+                             kwargs={"reply_channel_id": rcid}, daemon=True).start()
+            return
 
     low = merged_text.lower().strip()
+
+    # "resume <uuid>" → Session explizit binden (z.B. von Laptop-VSCode-Session)
+    _res_m = re.match(r'^resume\s+([a-f0-9][a-f0-9-]{35,})$', low)
+    if _res_m:
+        sid = _res_m.group(1)
+        work_dir = core.dir_for(CHANNEL_NAME)
+        session_key = f"explicit_{sid[:8]}"
+        core._save_session(work_dir, session_key, sid)
+        aid = _open_aufgabe(f"Explicit-Resume ses:{sid[:8]}", root_id=None)
+        with _aufgaben_lock:
+            if aid in _aufgaben:
+                _aufgaben[aid]["session_key"] = session_key
+        _save_aufgaben()
+        _post_text(f"▶️ Session `ses:{sid[:12]}` gebunden — schreib deine nächste Nachricht.", rcid)
+        return
 
     # "zurueck" / "was laeuft" / "aufgaben" → Liste zeigen, auf Auswahl warten
     if re.match(r"^(zur[uü]ck|zurueck|back|was l[aä]uft|aufgaben|welche aufgabe)", low):
@@ -1313,8 +1441,54 @@ async def event_handler(message):
             threading.Thread(target=_complete_mm_auth, args=(code_candidate,), daemon=True).start()
             return
     sender_name = (data["data"].get("sender_name") or "").lstrip("@") or "user"
-    # Debounce pro (User, Thread): Nachrichten aus verschiedenen Threads NICHT mischen.
+
+    # ── Sofort-Befehle (VOR Debounce — sofortige Antwort, kein 3s-Warten) ─────
+    _raw_msg = (post.get("message") or "").strip()
+    _low_msg = _raw_msg.lower()
     root_id = post.get("root_id") or ""
+    _rcid = reply_channel_id
+    _thread = root_id or None
+    if _low_msg in STATUS_WORDS or _low_msg in {"wie lange", "wie lange noch", "wie lange noch?",
+                                                  "was machst du gerade", "was machst du gerade?"}:
+        _post_text(_list_tasks(), _rcid, _thread)
+        return
+    _m_stop = re.match(r"(?:stop|unterbrich|abbrechen|abbruch|halt)\s*#?(\d+)", _low_msg)
+    if _m_stop:
+        _post_text(_stop(int(_m_stop.group(1))), _rcid, _thread)
+        return
+    if _low_msg in {"cwd", "pwd", "wo bin ich", "wo bin ich?", "verzeichnis", "dir"}:
+        _wd = _get_active()["dir"]
+        _exists = "✅" if os.path.isdir(_wd) else "❌ existiert nicht"
+        _post_text(f"📂 `{_wd}` {_exists}", _rcid, _thread)
+        return
+
+    # Pending Topic-Bestätigung (ja / nein / eigener Text)
+    _pending_root = root_id or post.get("id", "")
+    with _pending_lock:
+        _pend = _pending_topics.get(_pending_root)
+    if _pend is not None and _low_msg not in {"set topic", "topic", "titel", "status",
+                                               "cwd", "pwd", "stop", "resume"}:
+        if _low_msg in {"ja", "yes", "ok", "j", "y", "✅", "nehmen"}:
+            _post_text(_set_thread_topic(_pending_root, _pend), _rcid, _thread)
+        elif _low_msg in {"nein", "no", "n", "❌", "skip", "nicht"}:
+            _post_text("👍 Topic nicht gesetzt.", _rcid, _thread)
+        else:
+            # Eigener Text als Topic
+            _post_text(_set_thread_topic(_pending_root, _raw_msg), _rcid, _thread)
+        with _pending_lock:
+            _pending_topics.pop(_pending_root, None)
+        return
+
+    # "set topic" — manueller Aufruf
+    if _low_msg in {"set topic", "topic", "titel", "set titel", "thema"}:
+        _ctx = _fetch_thread_context(_pending_root, limit=5) if _pending_root else _raw_msg
+        threading.Thread(target=_do_suggest_topic,
+                         args=(_pending_root, _ctx, "", _get_active()["dir"], _rcid, _thread),
+                         daemon=True).start()
+        _post_text("🔍 analysiere Thread …", _rcid, _thread)
+        return
+
+    # Debounce pro (User, Thread): Nachrichten aus verschiedenen Threads NICHT mischen.
     key = (user_id, root_id)
     with _debounce_lock:
         if key in _debounce_buffers:

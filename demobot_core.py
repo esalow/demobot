@@ -1,43 +1,109 @@
 # -*- coding: utf-8 -*-
 """
-demobot_core.py — claude CLI Engine (frontend-agnostisch).
+demobot_core.py — Windows Claude CLI Engine
+Based on bot-core v1.6 (github.com/dw-hub-bot/bot-core)
 
-- Kanalname = Verzeichnis (Kanal 'demobot' -> C:\\projekte\\demobot)
-- Session pro Channel (--resume) fuer Kontext
-- Live-Streaming via --output-format stream-json -> on_progress je Schritt
-- Prozess-Handle via on_start -> Adapter kann "stop" ausloesen
-- Timeout-Watchdog killt haengende Laeufe
+3-layer resilience, session management, pre-compact backup, proactive ctx reset.
+
+Config via environment:
+  DEMOBOT_BASE_DIR         Bot instance dir (default: C:\projekte\demobot)
+  DEMOBOT_BASE             Projects root    (default: C:\projekte)
+  BOT_NAME                 Display name     (default: demobot)
+  CLAUDE_CMD               Path to claude
+  CLAUDE_MODEL             Model            (default: claude-sonnet-4-6)
+  BOT_CTX_LIMIT_BYTES      Proactive reset threshold (default: 2 MB)
+  BOT_BACKUP_MIN_BYTES     Min .jsonl size to backup (default: 100 KB)
+  BOT_BACKUP_KEEP          Session backups to keep   (default: 5)
+  DEMOBOT_SILENCE_TIMEOUT  Silence watchdog (default: 600 s)
+  DEMOBOT_MAX_TIMEOUT      Absolute max     (default: 3600 s)
 """
 
+import json
+import logging
 import os
 import re
-import json
 import shutil
 import socket
-import time
-import logging
-import datetime
-import threading
 import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
 
-_session_lock = threading.Lock()
-log = logging.getLogger("demobot-core")
+
+# ── Elevated-Privileges Guard (bot-core v1.6.1) ───────────────────────────────
+def _is_elevated() -> bool:
+    if sys.platform == "win32":
+        try:
+            import ctypes, ctypes.wintypes
+            TOKEN_QUERY = 0x0008
+            TokenElevation = 20
+            h = ctypes.wintypes.HANDLE()
+            if not ctypes.windll.advapi32.OpenProcessToken(
+                ctypes.windll.kernel32.GetCurrentProcess(), TOKEN_QUERY, ctypes.byref(h)
+            ):
+                return False
+            elev = ctypes.c_ulong(0)
+            sz = ctypes.c_ulong(ctypes.sizeof(elev))
+            ctypes.windll.advapi32.GetTokenInformation(
+                h, TokenElevation, ctypes.byref(elev), sz, ctypes.byref(sz)
+            )
+            ctypes.windll.kernel32.CloseHandle(h)
+            return elev.value != 0
+        except Exception:
+            return False
+    return os.geteuid() == 0
+
+if _is_elevated():
+    print("FATAL: demobot darf NICHT als Administrator laufen! "
+          "Claude blockiert bypassPermissions unter Admin.",
+          file=sys.stderr)
+    sys.exit(78)
+
+
+try:
+    from dotenv import load_dotenv
+    _env_base = Path(os.getenv("DEMOBOT_BASE_DIR", Path(__file__).parent))
+    load_dotenv(_env_base / ".env")
+except ImportError:
+    pass
+
+BOT_DIR       = Path(os.getenv("DEMOBOT_BASE_DIR", r"C:\projekte\demobot"))
+BOT_NAME      = os.getenv("BOT_NAME", "demobot")
+CLAUDE_CMD    = os.getenv(
+    "CLAUDE_CMD",
+    r"C:\Users\Lenovo T460p\AppData\Roaming\npm\claude.cmd")
+CLAUDE_MODEL  = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
+PROJ_ROOT     = os.getenv("DEMOBOT_BASE",          r"C:\projekte")
+BASE_DIR      = PROJ_ROOT   # Compat-Alias fuer demobot_mm.py (core.BASE_DIR = Projekte-Root)
+VORGANG_BASE  = os.getenv("DEMOBOT_VORGANG_BASE",
+                r"G:\Meine Ablage\ESALOW-Archiv\_vorgaenge")
+CLAUDE_META   = os.getenv("DEMOBOT_CLAUDE_META",   r"C:\projekte\claude-meta")
+LAST_CALL_FILE = (
+    Path(os.environ.get("USERPROFILE", r"C:\Users\Lenovo T460p"))
+    / ".claude" / "last_claude_call.txt"
+)
+
+CTX_LIMIT_BYTES  = int(os.getenv("BOT_CTX_LIMIT_BYTES",  str(2 * 1024 * 1024)))
+BACKUP_MIN_BYTES = int(os.getenv("BOT_BACKUP_MIN_BYTES", str(100 * 1024)))
+BACKUP_KEEP      = int(os.getenv("BOT_BACKUP_KEEP",      "5"))
+SILENCE_TIMEOUT  = int(os.getenv("DEMOBOT_SILENCE_TIMEOUT", "600"))
+MAX_TIMEOUT      = int(os.getenv("DEMOBOT_MAX_TIMEOUT",     "3600"))
+
+BACKUP_DIR = BOT_DIR / "session_backups"
+BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+(BOT_DIR / "logs").mkdir(parents=True, exist_ok=True)
+
+log     = logging.getLogger("demobot-core")
 MACHINE = os.environ.get("DEMOBOT_MACHINE") or socket.gethostname()
 
-BASE_DIR = os.environ.get("DEMOBOT_BASE", r"C:\projekte")
-CLAUDE_CMD = os.environ.get(
-    "CLAUDE_CMD", r"C:\Users\Lenovo T460p\AppData\Roaming\npm\claude.cmd")
-LAST_CALL_FILE = os.path.join(
-    os.environ.get("USERPROFILE", r"C:\Users\Lenovo T460p"),
-    ".claude", "last_claude_call.txt")
-SILENCE_TIMEOUT = int(os.environ.get("DEMOBOT_SILENCE_TIMEOUT",
-                      os.environ.get("DEMOBOT_TIMEOUT", "600")))
-MAX_TIMEOUT     = int(os.environ.get("DEMOBOT_MAX_TIMEOUT", "3600"))
-VORGANG_BASE = os.environ.get("DEMOBOT_VORGANG_BASE",
-    r"G:\Meine Ablage\ESALOW-Archiv\_vorgaenge")
-CLAUDE_META = os.environ.get("DEMOBOT_CLAUDE_META", r"C:\projekte\claude-meta")
+_session_lock = threading.Lock()
+_active_proc: dict = {}  # channel_key -> Popen (for cancel_run)
 
-APPEND_SYSTEM = (
+
+# ── System Prompt ─────────────────────────────────────────────────────────────
+
+_APPEND_SYSTEM_TMPL = (
     "KONTEXT: Du wirst per Mattermost gesteuert. Nachrichten kommen oft von Sprach-"
     "Transkription (Handy-Mikrofon) — sie koennen unpraezise, umgangssprachlich oder "
     "fehlerhaft transkribiert sein. Interpretiere semantisch, nicht woertlich. "
@@ -81,31 +147,61 @@ APPEND_SYSTEM = (
 )
 
 
-def dir_for(channel):
-    return os.path.join(BASE_DIR, channel)
+def _build_system_prompt(channel: str, work_dir: str,
+                         inbox_dir: str, outbox_dir: str,
+                         extra_append: str = "") -> str:
+    sources  = Path(CLAUDE_META) / "sources.json"
+    registry = Path(CLAUDE_META) / "project_registry.md"
+    prompt = _APPEND_SYSTEM_TMPL.format(
+        work_dir=work_dir, inbox_dir=inbox_dir, outbox_dir=outbox_dir,
+        sources_json=str(sources), project_registry=str(registry),
+    )
+    prompt += (
+        f" Du laeufst auf Maschine '{MACHINE}', Kanal '{channel}', "
+        f"Arbeitsverzeichnis '{work_dir}'. Wenn jemand fragt WER oder WO "
+        f"(welcher Rechner) eine Aufgabe bearbeitet hat, nenne diese Maschine: '{MACHINE}'."
+    )
+    if extra_append:
+        prompt += " " + extra_append
+    # Force single line — Windows claude.cmd splits on newlines -> falls back to plaintext
+    return " ".join(prompt.split())
 
 
-def _ensure(d):
-    os.makedirs(os.path.join(d, "_inbox"), exist_ok=True)
+# ── Directory helpers ─────────────────────────────────────────────────────────
+
+def dir_for(channel: str) -> str:
+    return os.path.join(PROJ_ROOT, channel)
+
+
+def _ensure(d: str):
+    os.makedirs(os.path.join(d, "_inbox"),  exist_ok=True)
     os.makedirs(os.path.join(d, "_outbox"), exist_ok=True)
 
 
-def _session_file(d):
+# ── Session Management ────────────────────────────────────────────────────────
+
+def _session_file(d: str) -> str:
     return os.path.join(d, ".sessions.json")
 
 
-def _load_session(d, channel):
+def _load_session(d: str, channel: str):
+    """Return session_id string for channel in directory d, or None."""
     with _session_lock:
         f = _session_file(d)
-        if os.path.exists(f):
-            try:
-                return json.load(open(f, encoding="utf-8")).get(channel)
-            except Exception:
-                return None
-        return None
+        if not os.path.exists(f):
+            return None
+        try:
+            data = json.load(open(f, encoding="utf-8"))
+            val = data.get(channel)
+            if isinstance(val, dict):
+                return val.get("session_id") or None
+            return val or None
+        except Exception:
+            return None
 
 
-def _save_session(d, channel, sid):
+def _save_session(d: str, channel: str, sid):
+    """Save session_id string (or None) for channel in directory d."""
     with _session_lock:
         f = _session_file(d)
         data = {}
@@ -113,59 +209,58 @@ def _save_session(d, channel, sid):
             try:
                 data = json.load(open(f, encoding="utf-8"))
             except Exception:
-                data = {}
+                pass
+        # Normalize any dict entries from old bot_core format
+        for k, v in list(data.items()):
+            if isinstance(v, dict):
+                data[k] = v.get("session_id") or None
         data[channel] = sid
         with open(f, "w", encoding="utf-8") as fh:
             json.dump(data, fh, ensure_ascii=False, indent=2)
 
 
-def _build_cmd(channel, d, stream, extra_append="", inbox_dir=None, outbox_dir=None):
-    """Baut die claude-Befehlszeile (OHNE Prompt — der kommt via stdin).
+def _proj_slug(d: str) -> str:
+    """C:\\projekte\\demobot -> C--projekte-demobot"""
+    return re.sub(r"[^a-zA-Z0-9]", "-", d)
 
-    WICHTIG: --append-system-prompt MUSS einzeilig sein. Ein Zeilenumbruch im
-    Argument bricht den Windows-Batch-Wrapper claude.cmd -> claude faellt auf
-    Plaintext zurueck und ignoriert --output-format stream-json. Darum hier alle
-    Whitespace-/Newline-Folgen zu einzelnen Leerzeichen kollabieren.
-    """
-    _inbox = inbox_dir or os.path.join(d, "_inbox")
-    _outbox = outbox_dir or os.path.join(d, "_outbox")
-    _sources = os.path.join(CLAUDE_META, "sources.json")
-    _registry = os.path.join(CLAUDE_META, "project_registry.md")
-    append = (APPEND_SYSTEM.format(
-                  work_dir=d, inbox_dir=_inbox, outbox_dir=_outbox,
-                  sources_json=_sources, project_registry=_registry) +
-              f"\n\nDu laeufst auf Maschine '{MACHINE}', Kanal '{channel}', "
-              f"Arbeitsverzeichnis '{d}'. Wenn jemand fragt WER oder WO (welcher "
-              f"Rechner) eine Aufgabe bearbeitet hat, nenne diese Maschine: '{MACHINE}'.")
-    if extra_append:
-        append += " " + extra_append
-    append = " ".join(append.split())  # einzeilig erzwingen (sonst Plaintext-Bug)
-    cmd = [CLAUDE_CMD,
-           "--permission-mode", "bypassPermissions",
-           "--append-system-prompt", append,
-           "--strict-mcp-config"]
-    cmd += (["--output-format", "stream-json", "--verbose"] if stream
-            else ["--output-format", "json"])
-    sid = _load_session(d, channel)
-    if sid:
-        cmd += ["--resume", sid]
-    # --mcp-config braucht einen DATEI-PFAD. Inline-JSON wird auf Windows ueber den
-    # claude.cmd-Wrapper entwertet (die Quotes gehen verloren -> claude sucht eine Datei
-    # "{mcpServers:{}}" und bricht ab: "MCP config file not found"). Darum eine kleine
-    # leere MCP-Config-Datei schreiben und ihren absoluten Pfad uebergeben.
-    mcp_file = os.path.join(d, ".mcp_empty.json")
+
+def _transcript_path(d: str, sid: str) -> Path:
+    return Path.home() / ".claude" / "projects" / _proj_slug(d) / f"{sid}.jsonl"
+
+
+def _session_size(d: str, sid: str) -> int:
+    """Return bytes of Claude transcript, 0 if missing."""
+    if not sid:
+        return 0
     try:
-        if not os.path.exists(mcp_file):
-            with open(mcp_file, "w", encoding="utf-8") as fh:
-                fh.write('{"mcpServers":{}}')
+        return _transcript_path(d, sid).stat().st_size
     except Exception:
-        pass
-    cmd += ["--mcp-config", mcp_file]
-    return cmd
+        return 0
 
+
+def _backup_session_jsonl(d: str, sid: str):
+    """Backup session .jsonl before proactive reset (pre-compact guard)."""
+    if not sid:
+        return
+    src = _transcript_path(d, sid)
+    if not src.exists() or src.stat().st_size < BACKUP_MIN_BYTES:
+        return
+    try:
+        ts  = time.strftime("%Y%m%d_%H%M%S")
+        dst = BACKUP_DIR / f"{sid[:8]}_{ts}.jsonl"
+        shutil.copy2(src, dst)
+        backups = sorted(BACKUP_DIR.glob("*.jsonl"))
+        for old in backups[:-BACKUP_KEEP]:
+            old.unlink(missing_ok=True)
+        log.info("[%s] session backup: %s -> %s", MACHINE, src.name, dst.name)
+    except Exception as e:
+        log.warning("[%s] session backup failed: %s", MACHINE, e)
+
+
+# ── Process Management ────────────────────────────────────────────────────────
 
 def kill_proc(proc):
-    """Prozessbaum killen (Windows: claude.cmd spawnt node-Kinder)."""
+    """Kill process tree (Windows: claude.cmd spawns node children)."""
     if not proc:
         return
     try:
@@ -178,79 +273,69 @@ def kill_proc(proc):
             pass
 
 
-def _fmt_tool(b):
-    name = b.get("name", "tool")
-    inp = b.get("input", {}) or {}
-    if inp.get("description"):
-        detail = str(inp["description"])
-    elif inp.get("command"):
-        detail = str(inp["command"])
-    elif inp.get("file_path"):
-        detail = os.path.basename(str(inp["file_path"]))
-    elif inp.get("path"):
-        detail = os.path.basename(str(inp["path"]))
-    elif inp:
-        detail = str(next(iter(inp.values())))
+def cancel_run(channel: str) -> bool:
+    """Terminate running claude process for channel. Returns True if found."""
+    proc = _active_proc.pop(channel, None)
+    if proc is None:
+        return False
+    kill_proc(proc)
+    log.info("[%s] cancel_run: killed ch=%s", MACHINE, channel)
+    return True
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _touch_last_call():
+    try:
+        LAST_CALL_FILE.write_text(time.strftime("%Y-%m-%dT%H:%M:%S"))
+    except Exception:
+        pass
+
+
+def _collect_outbox(outbox: str) -> list:
+    p = Path(outbox)
+    if not p.is_dir():
+        return []
+    return [str(f) for f in sorted(p.iterdir()) if f.is_file()]
+
+
+_TOO_LONG_MARKERS = (
+    "prompt is too long", "prompt too long", "input is too long",
+    "context length", "context window", "context limit", "too many tokens",
+)
+
+
+def _looks_too_long(text: str) -> bool:
+    if not text:
+        return False
+    return any(m in text.lower() for m in _TOO_LONG_MARKERS)
+
+
+def _fmt_tool(block: dict) -> str:
+    name = block.get("name", "tool")
+    inp  = block.get("input") or {}
+    if isinstance(inp, dict):
+        detail = (inp.get("description") or inp.get("command") or
+                  inp.get("file_path") or inp.get("path") or
+                  inp.get("pattern") or inp.get("url") or "")
     else:
         detail = ""
-    return (f"🔧 {name}: {detail}")[:180]
+    return (f"🔧 {name}: {str(detail)[:70]}")[:180]
 
 
-def _collect_outbox(outbox):
-    if not os.path.isdir(outbox):
-        return []
-    return [os.path.join(outbox, f) for f in sorted(os.listdir(outbox))
-            if os.path.isfile(os.path.join(outbox, f))]
-
-
-def _proj_slug(d):
-    """Claude legt Transkripte unter ~/.claude/projects/<slug>/<sid>.jsonl ab.
-    slug = Pfad, alle Nicht-Alphanumerischen Zeichen -> '-' (z.B.
-    'C:\\projekte\\demobot' -> 'C--projekte-demobot')."""
-    return re.sub(r"[^a-zA-Z0-9]", "-", d)
-
-
-def _transcript_path(d, sid):
-    return os.path.join(os.path.expanduser("~"), ".claude", "projects",
-                        _proj_slug(d), f"{sid}.jsonl")
-
-
-def _session_size(d, sid):
-    """Groesse des Session-Transkripts in Bytes (0 wenn nicht vorhanden)."""
-    if not sid:
-        return 0
-    try:
-        return os.path.getsize(_transcript_path(d, sid))
-    except Exception:
-        return 0
-
-
-def _aufg_suffix(channel):
-    """'demobot_A1' -> 'A1'; 'demobot' -> None. Zum Filtern von dialog.jsonl."""
+def _aufg_suffix(channel: str):
     return channel.split("_", 1)[1] if "_" in channel else None
 
 
-_TOO_LONG_MARKERS = ("prompt is too long", "prompt too long", "input is too long",
-                     "context length", "context window", "context limit",
-                     "too many tokens")
-
-
-def _looks_too_long(reply):
-    r = (reply or "").lower()
-    return any(m in r for m in _TOO_LONG_MARKERS)
-
-
-def _recent_context(d, channel, limit=30, maxlen=6000, aufgabe_filter=None):
-    """Kurzer Gespraechs-Kontext aus logs/dialog.jsonl.
-    aufgabe_filter: explizite Aufgaben-ID z.B. 'A39' (überstimmt _aufg_suffix).
-    Gefiltert nach Aufgaben-ID des Kanals, damit Threads nicht vermischt werden."""
+def _recent_context(d: str, channel: str, limit=30, maxlen=6000,
+                    aufgabe_filter=None) -> str:
     f = os.path.join(d, "logs", "dialog.jsonl")
     if not os.path.exists(f):
         return ""
     suf = aufgabe_filter if aufgabe_filter is not None else _aufg_suffix(channel)
     rows = []
     try:
-        with open(f, encoding="utf-8") as fh:
+        with open(f, encoding="utf-8", errors="replace") as fh:
             for line in fh:
                 line = line.strip()
                 if not line:
@@ -266,149 +351,109 @@ def _recent_context(d, channel, limit=30, maxlen=6000, aufgabe_filter=None):
         return ""
     parts = []
     for e in rows[-limit:]:
-        ts = (e.get("ts") or "")[:10]  # nur Datum
-        proj = e.get("projekt") or ""
-        q = " ".join((e.get("in") or "").split())
-        a = " ".join((e.get("out") or "").split())
-        if not (q or a):
-            continue
-        proj_tag = f" [{proj}]" if proj and proj != channel.split("_")[0] else ""
-        parts.append(f"[{ts}]{proj_tag} F: {q[:130]} | A: {a[:130]}")
+        ts = (e.get("ts") or "")[:10]
+        q  = " ".join((e.get("in")  or "").split())
+        a  = " ".join((e.get("out") or "").split())
+        if q or a:
+            parts.append(f"[{ts}] F: {q[:130]} | A: {a[:130]}")
     return "\n".join(parts)[:maxlen]
 
 
-_SUMMARIES_DIR = "_summaries"
-
-
-def _summary_path(d, root_id):
-    return os.path.join(d, _SUMMARIES_DIR, f"mm_{root_id}.md")
-
-
-def _load_summary(d, root_id):
-    if not root_id:
-        return ""
-    try:
-        return open(_summary_path(d, root_id), encoding="utf-8").read().strip()
-    except Exception:
-        return ""
-
-
-def _save_summary(d, root_id, text):
-    if not root_id or not text:
-        return
-    os.makedirs(os.path.join(d, _SUMMARIES_DIR), exist_ok=True)
-    with open(_summary_path(d, root_id), "w", encoding="utf-8") as fh:
-        fh.write(text)
-
-
-def _generate_summary(d, channel, sid):
-    """Ruft Claude (bestehende Session) auf und bittet um Kontext-Zusammenfassung."""
-    if not sid:
-        return None
-    mcp_file = os.path.join(d, ".mcp_empty.json")
-    cmd = [CLAUDE_CMD,
-           "--permission-mode", "bypassPermissions",
-           "--output-format", "json",
-           "--resume", sid,
-           "--mcp-config", mcp_file,
-           "--strict-mcp-config"]
-    prompt = (
-        "Erstelle eine kompakte Zusammenfassung dieser Konversation auf Deutsch. "
-        "Format:\n## Thema\n[Was wird bearbeitet]\n\n## Stand\n[Was wurde entschieden/erreicht]\n\n"
-        "## Offen\n[Was ist noch zu tun]\n\n## Key Facts\n[Wichtige Werte, Pfade, Namen]\n\n"
-        "Maximal 2000 Zeichen. Nur Fakten, keine Prosa."
-    )
-    try:
-        r = subprocess.run(cmd, input=prompt, capture_output=True,
-                           text=True, encoding="utf-8", errors="replace",
-                           timeout=120, cwd=d)
-        try:
-            return json.loads(r.stdout).get("result", "").strip() or None
-        except Exception:
-            return None
-    except Exception:
-        log.warning("[%s] Summary-Generierung fehlgeschlagen kanal=%s", MACHINE, channel)
-        return None
-
-
-def _reseed_prefix(d, channel, aufgabe_filter=None, root_id=None):
-    """Baut den Kurz-Kontext-Block, der nach einem Session-Reset vorangestellt wird.
-    Wenn eine gespeicherte Zusammenfassung existiert, wird sie bevorzugt injiziert."""
-    summary = _load_summary(d, root_id) if root_id else ""
+def _reseed_prefix(d: str, channel: str, aufgabe_filter=None, root_id=None) -> str:
     ctx = _recent_context(d, channel, aufgabe_filter=aufgabe_filter)
-    if summary:
-        block = "[System: Session zurückgesetzt (Größenlimit). Kontext-Zusammenfassung:\n" + summary
-        if ctx:
-            block += "\n\nLetzter Dialog:\n" + ctx
-        return block + "]"
     if not ctx:
         return ("[System: Die vorherige Session wurde wegen Laenge zurueckgesetzt. "
                 "Kein Kurzprotokoll verfuegbar — frage bei Bedarf nach Kontext.]")
-    return ("[System: Die vorherige Session wurde wegen Laenge zurueckgesetzt "
-            "(Kontext-Limit). Letzte Punkte aus dem Gespraech als Kurz-Kontext:\n"
-            + ctx +
-            "\nKnuepfe daran an; frage nach falls Details fehlen.]")
+    return (
+        "[System: Die vorherige Session wurde wegen Laenge zurueckgesetzt "
+        "(Kontext-Limit). Letzte Punkte aus dem Gespraech als Kurz-Kontext:\n"
+        + ctx
+        + "\nKnuepfe daran an; frage nach falls Details fehlen.]"
+    )
 
 
-def _new_session_prefix(d, channel, aufgabe_filter=None):
-    """Kurz-Kontext fuer den Start einer neuen Session (z.B. nach Bot-Neustart).
-    Injiziert die letzten Dialoge damit der Bot sich 'erinnert'."""
+def _new_session_prefix(d: str, channel: str, aufgabe_filter=None) -> str:
     ctx = _recent_context(d, channel, aufgabe_filter=aufgabe_filter)
     if not ctx:
         return ""
-    return ("[System: Neue Session (Gedaechtnis-Kontext aus Verlauf):\n"
-            + ctx +
-            "\nKnuepfe daran an falls relevant; frage nach falls Details fehlen.]")
+    return (
+        "[System: Neue Session (Gedaechtnis-Kontext aus Verlauf):\n"
+        + ctx
+        + "\nKnuepfe daran an falls relevant; frage nach falls Details fehlen.]"
+    )
 
 
-def _touch_last_call():
+def _ensure_mcp_empty(d: str) -> str:
+    mcp_file = os.path.join(d, ".mcp_empty.json")
     try:
-        with open(LAST_CALL_FILE, "w") as f:
-            f.write(datetime.datetime.now().isoformat())
+        if not os.path.exists(mcp_file):
+            with open(mcp_file, "w", encoding="utf-8") as fh:
+                fh.write('{"mcpServers":{}}')
     except Exception:
         pass
+    return mcp_file
 
 
-def _run_once(channel, d, prompt, on_progress, on_start, extra_append,
-              inbox_dir, outbox_dir, on_session=None):
-    """Ein einzelner claude-Lauf (Streaming). Speichert die neue Session-ID.
-    Gibt (reply_text, outbox_files) zurueck."""
+# ── Single Run ────────────────────────────────────────────────────────────────
+
+def _run_once(channel: str, d: str, prompt: str, session_id,
+              inbox_dir: str, outbox_dir: str, extra_append: str = "",
+              on_progress=None, on_start=None, on_session=None) -> tuple:
+    """Single streaming Claude run. Returns (reply_text, new_session_id)."""
     _touch_last_call()
-    t0 = time.time()
-    sid_before = _load_session(d, channel)
-    log.info("[%s] claude-call START kanal=%s sid=%s", MACHINE, channel, sid_before[:8] if sid_before else "neu")
-    cmd = _build_cmd(channel, d, stream=True, extra_append=extra_append,
-                     inbox_dir=inbox_dir, outbox_dir=outbox_dir)
-    # Prompt via stdin (NICHT -p): mehrzeilige Aufgaben bleiben erhalten und
-    # umgehen den Batch-Wrapper-Bug (Newline im Argument -> Plaintext).
-    proc = subprocess.Popen(cmd, cwd=d, stdin=subprocess.PIPE,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True,
-                            encoding="utf-8", errors="replace", bufsize=1)
+    mcp_file   = _ensure_mcp_empty(d)
+    sys_prompt = _build_system_prompt(channel, d, inbox_dir, outbox_dir, extra_append)
+
+    cmd = [
+        CLAUDE_CMD,
+        "--permission-mode", "bypassPermissions",
+        "--output-format", "stream-json",
+        "--verbose",
+        "--model", CLAUDE_MODEL,
+        "--append-system-prompt", sys_prompt,
+        "--strict-mcp-config",
+        "--mcp-config", mcp_file,
+    ]
+    if session_id:
+        cmd += ["--resume", session_id]
+
+    log.info("[%s] claude START ch=%s sid=%s cwd=%s",
+             MACHINE, channel, (session_id or "new")[:8], d)
+
+    proc = subprocess.Popen(
+        cmd, cwd=d,
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="replace", bufsize=1,
+    )
+    _active_proc[channel] = proc
+
     try:
         proc.stdin.write(prompt)
         proc.stdin.close()
     except Exception:
         pass
+
     if on_start:
         try:
             on_start(proc)
         except Exception:
             pass
 
-    # Silence-Watchdog: feuert nur wenn Claude X Sek lang gar nichts ausgibt
-    # Max-Timer: absolute Obergrenze unabhaengig von Output
+    # Silence watchdog — fires if Claude goes silent for SILENCE_TIMEOUT seconds
     _killed = [False]
+
     def _do_kill():
         if not _killed[0]:
             _killed[0] = True
             kill_proc(proc)
+
     _stimer = [threading.Timer(SILENCE_TIMEOUT, _do_kill)]
     _stimer[0].daemon = True
     _stimer[0].start()
     _max_t = threading.Timer(MAX_TIMEOUT, _do_kill)
     _max_t.daemon = True
     _max_t.start()
+
     def _reset_silence():
         _stimer[0].cancel()
         t = threading.Timer(SILENCE_TIMEOUT, _do_kill)
@@ -416,46 +461,53 @@ def _run_once(channel, d, prompt, on_progress, on_start, extra_append,
         _stimer[0] = t
         t.start()
 
-    reply = ""
-    new_sid = None
+    reply      = ""
+    new_sid    = [session_id]
+    _on_ses_cb = [on_session]
+
     try:
         for line in proc.stdout:
             line = line.strip()
             if not line:
                 continue
-            _reset_silence()  # Claude lebt -- Silence-Watchdog zuruecksetzen
+            _reset_silence()
             try:
-                e = json.loads(line)
+                ev = json.loads(line)
             except Exception:
                 continue
-            t = e.get("type")
-            if t == "system" and e.get("session_id"):
-                new_sid = e["session_id"]
-                if on_session and new_sid:
+
+            ev_type = ev.get("type", "")
+
+            if ev_type == "system" and ev.get("session_id"):
+                new_sid[0] = ev["session_id"]
+                if _on_ses_cb[0]:
                     try:
-                        on_session(new_sid)
+                        _on_ses_cb[0](new_sid[0])
                     except Exception:
                         pass
-                    on_session = None  # nur einmal feuern
-            elif t == "assistant":
-                for b in e.get("message", {}).get("content", []):
-                    bt = b.get("type")
-                    if bt == "tool_use" and on_progress:
+                    _on_ses_cb[0] = None  # fire once
+
+            elif ev_type == "assistant":
+                for block in ev.get("message", {}).get("content", []):
+                    btype = block.get("type")
+                    if btype == "tool_use" and on_progress:
                         try:
-                            on_progress(_fmt_tool(b))
+                            on_progress(_fmt_tool(block))
                         except Exception:
                             pass
-                    elif bt == "text":
-                        txt = (b.get("text") or "").strip()
+                    elif btype == "text":
+                        txt = (block.get("text") or "").strip()
                         if txt and on_progress:
                             try:
                                 on_progress("💬 " + txt[:300])
                             except Exception:
                                 pass
-            elif t == "result":
-                reply = e.get("result", "") or reply
-                if e.get("session_id"):
-                    new_sid = e["session_id"]
+
+            elif ev_type == "result":
+                reply = ev.get("result", "") or reply
+                if ev.get("session_id"):
+                    new_sid[0] = ev["session_id"]
+
     finally:
         _stimer[0].cancel()
         _max_t.cancel()
@@ -463,40 +515,44 @@ def _run_once(channel, d, prompt, on_progress, on_start, extra_append,
             proc.wait(timeout=5)
         except Exception:
             pass
+        _active_proc.pop(channel, None)
 
-    dauer = round(time.time() - t0, 1)
-    if new_sid:
-        _save_session(d, channel, new_sid)
     if reply:
-        log.info("[%s] claude-call DONE kanal=%s dauer=%.1fs reply_len=%d", MACHINE, channel, dauer, len(reply))
+        log.info("[%s] claude DONE ch=%s len=%d sid=%s",
+                 MACHINE, channel, len(reply), (new_sid[0] or "")[:8])
     else:
-        log.warning("[%s] claude-call LEER kanal=%s dauer=%.1fs — kein Text vom CLI", MACHINE, channel, dauer)
-    return (reply, _collect_outbox(outbox_dir))
+        log.warning("[%s] claude LEER ch=%s — kein Text vom CLI", MACHINE, channel)
+
+    return (reply, new_sid[0])
 
 
-def run_stream(channel, user_text, incoming_files=None, on_progress=None, on_start=None,
-               on_notice=None, extra_append="", work_dir=None, inbox_dir=None, outbox_dir=None,
+# ── Public API ────────────────────────────────────────────────────────────────
+
+def run_stream(channel: str, user_text: str,
+               incoming_files=None, on_progress=None, on_start=None, on_notice=None,
+               extra_append: str = "", work_dir: str = None,
+               inbox_dir: str = None, outbox_dir: str = None,
                aufgabe_filter=None, root_id=None, on_session=None):
-    """Fuehrt claude LIVE aus. on_progress(text) je Schritt, on_start(proc) sobald
-    der Prozess laeuft (fuer stop). extra_append = zusaetzlicher System-Prompt-Hinweis.
-    work_dir überschreibt das Arbeitsverzeichnis (für Projekt-Routing).
-    inbox_dir/outbox_dir überschreiben die Datei-Pfade im System-Prompt.
-    aufgabe_filter: Aufgaben-ID für dialog.jsonl-Filterung (z.B. 'A39').
-    root_id: Mattermost-Thread-Root-ID (für Reseed bei Schicht-2).
-    on_session(sid): wird einmalig gefeuert sobald Claude die Session-ID meldet.
+    """
+    3-layer resilience engine (bot-core v1.6, Windows-adapted).
 
-    Kontext-Management:
-    - Schicht 2 (Notfall): meldet ein Resume-Lauf 'prompt too long', wird die Session
-      zurueckgesetzt, ein Kurz-Kontext vorangestellt und EINMAL neu versucht.
-    Gibt (reply_text, outbox_files) zurueck."""
-    d = work_dir or dir_for(channel)
-    if not os.path.isdir(d):
-        return (f"Verzeichnis existiert nicht: {d}", [])
-    _inbox = inbox_dir or os.path.join(d, "_inbox")
+    Layer 1 (proactive):  session transcript > CTX_LIMIT_BYTES
+                          -> backup + fresh session + reseed
+    Layer 2 (emergency):  reply contains 'prompt too long'
+                          -> backup + reset + retry
+    Layer 3 (empty):      no reply at all
+                          -> reset + summary request
+
+    Returns (reply_text, outbox_files).
+    """
+    d       = work_dir or dir_for(channel)
+    _inbox  = inbox_dir  or os.path.join(d, "_inbox")
     _outbox = outbox_dir or os.path.join(d, "_outbox")
-    os.makedirs(_inbox, exist_ok=True)
+
+    os.makedirs(_inbox,  exist_ok=True)
     os.makedirs(_outbox, exist_ok=True)
-    os.makedirs(d, exist_ok=True)
+    os.makedirs(d,       exist_ok=True)
+
     incoming_files = incoming_files or []
     prompt = (user_text or "").strip()
     if incoming_files:
@@ -506,7 +562,6 @@ def run_stream(channel, user_text, incoming_files=None, on_progress=None, on_sta
         return ("", [])
 
     def _say(msg):
-        # on_progress = transiente Live-Zeile, on_notice = permanente Kanal-Meldung
         for cb in (on_progress, on_notice):
             if cb:
                 try:
@@ -514,69 +569,99 @@ def run_stream(channel, user_text, incoming_files=None, on_progress=None, on_sta
                 except Exception:
                     pass
 
-    t0_total = time.time()
-    sid = _load_session(d, channel)
-    resuming = bool(sid)
+    t0             = time.time()
+    sid            = _load_session(d, channel)
+    resuming       = bool(sid)
     session_resets = 0
 
-    # Gedaechtnis-Kontext bei neuer Session (kein bestehender Resume): letzte Dialoge voranstellen
+    # ── Layer 1: proactive reset when context file exceeds limit ──────────────
+    sz = _session_size(d, sid) if sid else 0
+    if sid and sz > CTX_LIMIT_BYTES:
+        log.warning("[%s] Layer 1: ctx %d > %d bytes — fresh session ch=%s",
+                    MACHINE, sz, CTX_LIMIT_BYTES, channel)
+        _backup_session_jsonl(d, sid)
+        _save_session(d, channel, None)
+        _say("♻️ Kontext-Limit (proaktiv) — Session gesichert, frischer Start, Kurz-Kontext übernommen.")
+        prompt = (_reseed_prefix(d, channel, aufgabe_filter=aufgabe_filter, root_id=root_id)
+                  + "\n\n---\n\n" + prompt)
+        sid      = None
+        resuming = False
+        session_resets += 1
+
+    # ── Memory context for brand-new sessions ─────────────────────────────────
     if not sid:
         mem = _new_session_prefix(d, channel, aufgabe_filter=aufgabe_filter)
         if mem:
             prompt = mem + "\n\n---\n\n" + prompt
 
-    reply, outfiles = _run_once(channel, d, prompt, on_progress, on_start,
-                                extra_append, _inbox, _outbox, on_session=on_session)
+    reply, new_sid = _run_once(
+        channel, d, prompt, sid,
+        _inbox, _outbox, extra_append,
+        on_progress=on_progress, on_start=on_start, on_session=on_session,
+    )
 
-    # Schicht 2 (Notfall): Resume trotzdem ins Limit gelaufen -> Reset + Reseed + 1x Retry
+    if new_sid:
+        _save_session(d, channel, new_sid)
+
+    # ── Layer 2: context overflow detected in reply ───────────────────────────
     if resuming and _looks_too_long(reply):
-        log.warning("[%s] Schicht-2: Kontext-Limit im Resume — reset + reseed + retry kanal=%s",
+        log.warning("[%s] Layer 2: 'prompt too long' — reset + reseed + retry ch=%s",
                     MACHINE, channel)
-        _say("♻️ Kontext-Limit erreicht — Session zurueckgesetzt, Kurz-Kontext "
-             "uebernommen, neuer Versuch.")
+        _backup_session_jsonl(d, new_sid or sid)
         _save_session(d, channel, None)
-        retry_prompt = _reseed_prefix(d, channel, aufgabe_filter=aufgabe_filter,
-                                      root_id=root_id) + "\n\n---\n\n" + prompt
-        reply, outfiles = _run_once(channel, d, retry_prompt, on_progress, on_start,
-                                    extra_append, _inbox, _outbox, on_session=on_session)
+        _say("♻️ Kontext-Limit erreicht — Session zurückgesetzt, neuer Versuch.")
+        retry_prompt = (_reseed_prefix(d, channel,
+                                       aufgabe_filter=aufgabe_filter, root_id=root_id)
+                        + "\n\n---\n\n" + prompt)
+        reply, new_sid = _run_once(
+            channel, d, retry_prompt, None,
+            _inbox, _outbox, extra_append,
+            on_progress=on_progress, on_start=on_start, on_session=on_session,
+        )
+        if new_sid:
+            _save_session(d, channel, new_sid)
         session_resets += 1
 
-    # Schicht 3: Keine Textantwort -> Session zuruecksetzen + frisch nachfragen
+    # ── Layer 3: empty reply ──────────────────────────────────────────────────
     if not reply:
-        log.warning("[%s] Schicht-3: leere Antwort — session reset + text-retry kanal=%s",
-                    MACHINE, channel)
+        log.warning("[%s] Layer 3: empty reply — reset + summary ch=%s", MACHINE, channel)
         _save_session(d, channel, None)
         session_resets += 1
-        reply2, extra_files = _run_once(
+        reply, new_sid = _run_once(
             channel, d,
             "Fasse in 1-2 Saetzen auf Deutsch zusammen was du fuer den User getan hast. "
             "Falls du noch nichts getan hast, beantworte die letzte Anfrage kurz.",
-            on_progress, on_start, extra_append, _inbox, _outbox, on_session=on_session)
-        reply = reply2
-        outfiles = outfiles or extra_files
+            None,
+            _inbox, _outbox, extra_append,
+            on_progress=on_progress, on_start=on_start, on_session=on_session,
+        )
+        if new_sid:
+            _save_session(d, channel, new_sid)
 
-    dauer_total = round(time.time() - t0_total, 1)
+    dauer_total = round(time.time() - t0, 1)
     if not reply:
-        log.error("[%s] KEIN TEXT nach %d Versuchen, %.1fs, kanal=%s",
+        log.error("[%s] KEIN TEXT nach %d Versuchen, %.1fs, ch=%s",
                   MACHINE, session_resets + 1, dauer_total, channel)
 
-    final = reply or "❌ Keine Antwort (Claude hat zweimal keinen Text geliefert — bitte neu versuchen)."
-    # Metadaten als Attribut fuer den Caller (optional nutzbar)
     run_stream.last_meta = {
-        "dauer_s": dauer_total,
+        "dauer_s":        dauer_total,
         "session_resets": session_resets,
-        "machine": MACHINE,
-        "session_id": _load_session(d, channel),
+        "machine":        MACHINE,
+        "session_id":     _load_session(d, channel),
     }
+
+    outfiles = _collect_outbox(_outbox)
+    final = (reply or
+             "❌ Keine Antwort (Claude hat zweimal keinen Text geliefert — bitte neu versuchen).")
     return (final, outfiles)
 
 
-def archive_sent(channel, pfade):
-    """Gesendete _outbox-Dateien ins Archiv _sent\\ verschieben (kein Loeschen)."""
-    d = dir_for(channel)
+def archive_sent(channel: str, pfade: list):
+    """Move sent _outbox files to _sent archive (no delete)."""
+    d    = dir_for(channel)
     sent = os.path.join(d, "_sent")
     os.makedirs(sent, exist_ok=True)
-    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+    stamp = time.strftime("%Y%m%d_%H%M%S")
     for p in pfade:
         if os.path.isfile(p):
             try:
