@@ -86,9 +86,6 @@ API_BASE = f"{MM_SCHEME}://{MM_URL}/api/v4"
 AUTH_H = {"Authorization": "Bearer " + MM_TOKEN}
 DEMOBOT_DIR = core.dir_for(CHANNEL_NAME)
 
-_pending_topics: dict = {}   # root_id → vorgeschlagener Topic-String
-_pending_lock = threading.Lock()
-
 _BOTCORE_VERSION = "?"
 try:
     _vc = os.path.join(os.path.dirname(__file__), "..", "bot-core", "VERSION")
@@ -663,69 +660,34 @@ def _create_post(msg, channel_id=None, root_id=None):
 
 # ── Thread-Topic ──────────────────────────────────────────────────────────────
 
-TOPIC_TYPES = ["Recherche", "Implementierung", "Analyse", "Bug", "Planung", "Review"]
-
-
-def _generate_topic(user_text: str, claude_reply: str, work_dir: str) -> str:
-    """Haiku-Schnellaufruf → '[Typ] | [3 Wörter]'."""
-    proj = os.path.basename(work_dir)
-    prompt = (
-        f"Projekt: {proj}. Anfrage: {user_text[:150]}. "
-        f"Antwort-Kurzfassung: {claude_reply[:200]}. "
-        f"Antworte NUR mit einer Zeile: [Typ] | [3 Wörter]. "
-        f"Erlaubte Typen: {', '.join(TOPIC_TYPES)}. "
-        f"Beispiel: Implementierung | demobot Sofort-Befehle"
-    )
-    claude_cmd = os.environ.get("CLAUDE_CMD", "claude")
-    try:
-        res = subprocess.run(
-            [claude_cmd, "-p", prompt, "--model", "claude-haiku-4-5-20251001"],
-            capture_output=True, text=True, timeout=30, encoding="utf-8", errors="replace"
-        )
-        line = (res.stdout or "").strip().splitlines()[0][:60]
-        return line if "|" in line else f"Aufgabe | {proj}"
-    except Exception:
-        return f"Aufgabe | {proj}"
-
-
-_topic_post_ids: dict = {}  # root_id → bot-eigene Topic-Post-ID
-
-
 def _set_thread_topic(root_id: str, topic: str, channel_id: str = "") -> str:
-    """Bot-eigenen 🔖-Post im Thread setzen oder updaten (kein fremder Post nötig)."""
-    msg = f"🔖 **{topic}**"
+    """### Titel ### als Prefix in den ersten Bot-Reply im Thread schreiben.
+    Existiert bereits ein ### ... ### Prefix → an Position 0 ersetzen.
+    """
     try:
-        existing_id = _topic_post_ids.get(root_id)
-        if not existing_id:
-            r = requests.get(f"{API_BASE}/posts/{root_id}/thread", headers=AUTH_H, timeout=10)
-            r.raise_for_status()
-            for p in (r.json().get("posts") or {}).values():
-                if p.get("user_id") == BOT_USER_ID and (p.get("message") or "").startswith("🔖"):
-                    existing_id = p["id"]
-                    _topic_post_ids[root_id] = existing_id
-                    break
-        if existing_id:
-            requests.put(f"{API_BASE}/posts/{existing_id}", headers=AUTH_H,
-                         json={"id": existing_id, "message": msg}, timeout=10).raise_for_status()
-        else:
-            cid = channel_id or MM_CHANNEL_ID
-            p = _create_post(msg, cid, root_id=root_id)
-            _topic_post_ids[root_id] = p.get("id", "")
-        return f"🔖 `{topic}` gesetzt."
+        r = requests.get(f"{API_BASE}/posts/{root_id}/thread", headers=AUTH_H, timeout=10)
+        r.raise_for_status()
+        posts = sorted((r.json().get("posts") or {}).values(),
+                       key=lambda p: p.get("create_at", 0))
+        first_bot = None
+        for p in posts:
+            if p.get("user_id") == BOT_USER_ID and p.get("root_id") == root_id:
+                first_bot = p
+                break
+        if not first_bot:
+            return "❌ Kein Bot-Post im Thread gefunden — erst eine Frage stellen."
+        pid  = first_bot["id"]
+        body = (first_bot.get("message") or "")
+        if body.startswith("###"):
+            end = body.find("###", 3)
+            if end != -1:
+                body = body[end + 3:].lstrip("\n")
+        new_msg = f"### {topic} ###\n\n{body}"
+        requests.put(f"{API_BASE}/posts/{pid}", headers=AUTH_H,
+                     json={"id": pid, "message": new_msg}, timeout=10).raise_for_status()
+        return f"📌 `{topic}` gesetzt."
     except Exception as e:
         return f"❌ Topic setzen fehlgeschlagen: {e}"
-
-
-def _do_suggest_topic(root_id: str, user_text: str, claude_reply: str,
-                      work_dir: str, reply_channel_id, thread) -> None:
-    """Im Hintergrund: Topic generieren → Vorschlag in Thread posten."""
-    topic = _generate_topic(user_text, claude_reply, work_dir)
-    with _pending_lock:
-        _pending_topics[root_id] = topic
-    _post_text(
-        f"💡 Vorschlag: `{topic}`\n→ als Thread-Titel setzen?  **ja** · **nein** · oder eigenen Text eingeben",
-        reply_channel_id, thread
-    )
 
 
 # ── Patch ─────────────────────────────────────────────────────────────────────
@@ -1037,12 +999,6 @@ def _process(text, files, sender="user", aufgabe_id=None, reply_channel_id=None)
             _patch(tk["post_id"], f"✅ **{label_num}**{label}{ses_tag} — _{title}_\n\n{(reply or '')[:15000]}{footer}")
             if aufgabe_id:
                 _update_aufgaben_post(aufgabe_id, "DONE", preview=reply)
-            # Auto-Topic nach erster Antwort im Thread (sub == 1)
-            if sub == 1 and thread_root and thread_root not in _pending_topics:
-                threading.Thread(target=_do_suggest_topic,
-                                 args=(thread_root, text, reply or "", wdir_fin,
-                                       reply_channel_id, thread_root),
-                                 daemon=True).start()
             sent = []
             for p in outfiles:
                 try:
@@ -1471,30 +1427,12 @@ async def event_handler(message):
         _post_text(f"📂 `{_wd}` {_exists}", _rcid, _thread)
         return
 
-    # Pending Topic-Bestätigung (ja / nein / eigener Text)
-    _pending_root = root_id or post.get("id", "")
-    with _pending_lock:
-        _pend = _pending_topics.get(_pending_root)
-    if _pend is not None and _low_msg not in {"set topic", "topic", "titel", "status",
-                                               "cwd", "pwd", "stop", "resume"}:
-        if _low_msg in {"ja", "yes", "ok", "j", "y", "✅", "nehmen"}:
-            _post_text(_set_thread_topic(_pending_root, _pend), _rcid, _thread)
-        elif _low_msg in {"nein", "no", "n", "❌", "skip", "nicht"}:
-            _post_text("👍 Topic nicht gesetzt.", _rcid, _thread)
-        else:
-            # Eigener Text als Topic
-            _post_text(_set_thread_topic(_pending_root, _raw_msg), _rcid, _thread)
-        with _pending_lock:
-            _pending_topics.pop(_pending_root, None)
-        return
-
-    # "set topic" — manueller Aufruf
-    if _low_msg in {"set topic", "topic", "titel", "set titel", "thema"}:
-        _ctx = _fetch_thread_context(_pending_root, limit=5) if _pending_root else _raw_msg
-        threading.Thread(target=_do_suggest_topic,
-                         args=(_pending_root, _ctx, "", _get_active()["dir"], _rcid, _thread),
-                         daemon=True).start()
-        _post_text("🔍 analysiere Thread …", _rcid, _thread)
+    # "set topic <Text>" — manuell, direkt als ### Text ### Prefix in ersten Bot-Reply
+    _topic_root = root_id or post.get("id", "")
+    _set_topic_m = re.match(r'^set\s+topic\s+(.+)$', _raw_msg, re.IGNORECASE)
+    if _set_topic_m:
+        topic_text = _set_topic_m.group(1).strip()
+        _post_text(_set_thread_topic(_topic_root, topic_text, _rcid), _rcid, _thread)
         return
 
     # Debounce pro (User, Thread): Nachrichten aus verschiedenen Threads NICHT mischen.
