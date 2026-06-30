@@ -125,6 +125,16 @@ LAPTOP (PC-WLPT)                          VPS (hetzner-vps)
 | Token-Expiry | Task Scheduler + Idle-Check | `refresh_claude_token.ps1` |
 | Kein Auto-Restart | DemobotWatchdog (5 Min) | Task Scheduler |
 
+## Auth-Paradigma: OAuth-Subscription, NIEMALS API-Key <!-- v1.0 | 2026-06-30 -->
+
+> Verbindlich — auch wenn Scripts oder Vorschläge auf API-Key hindeuten.
+
+- **NIEMALS** `ANTHROPIC_API_KEY` verwenden — Eike hat Claude Max Subscription (Pauschal)
+- Auth läuft via `claude auth login` OAuth-Flow → Code per MM-Kanal
+- Credentials lokal gespeichert in `%USERPROFILE%\.claude\.credentials.json`
+- Laptop-Credentials sind i.d.R. frisch (Claude Code läuft hier aktiv)
+- Details + geplanter Auto-Refresh: `C:\projekte\bot-core\CLAUDE.md`
+
 ## Entwicklungsregeln
 
 - Vor jeder Änderung: Logs lesen (`logs/bot_err.log`, `logs/dialog.jsonl`)
