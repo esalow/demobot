@@ -1,24 +1,65 @@
-# Secrets & lokaler Laufzeit-Zustand (NIE committen)
-.env
+﻿# Runtime state
+.pid
+.startup_ts
 .sessions.json
-.sessions.json.bak
-_aufgaben.json
+.sessions_backup_*.json
+_restart_history.json
+_bot_state.json
+
+# Logs
+logs/
+*.log
+
+# Secrets
+.env
+
+# Session backups
+session_backups/
+
+# Claude internal
+.claude/
+
+# Temp / work files
+_work/
+_mc_*.json
+*.db
+*.csv
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Nicht ins Repo
+refresh_claude_token.sh
+Belegablage/
+_fedex_komprimiert/
+goldset/
+villa/
+start_nc_mount.bat
+
+# Pycache
 __pycache__/
 *.pyc
 
-# Laufzeit-Ordner (Dateiaustausch, pro Maschine)
+# Runtime JSON
+_aufgaben.json
+
+# Inbox/Outbox/Sent
 _inbox/
-_outbox/
 _sent/
-_jobs/
 
-# lokale Scratch-/Test-Dateien
+# Temp-Dateien
 _tmp_*.py
-test_*.py
+_tmp_*.txt
+_mc_today.txt
+_msg.txt
+_pick.txt
+_thread_test_root.txt
+_villa_test1.txt
+.sessions.json.bak
 
-# Logs & Temp (nicht ins Repo)
-logs/
-*.log
-_tmp_*
-*.bak
-*.txt
+# Scripts die nicht zum Bot gehören
+test_core.py
+test_rs.py
+test_stream.py
+test_thread.py

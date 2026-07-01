@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 demobot_core.py — Windows Claude CLI Engine
-Based on bot-core v1.6 (github.com/dw-hub-bot/bot-core)
+Based on bot-core v1.7.0 (github.com/dw-hub-bot/bot-core)
 
 3-layer resilience, session management, pre-compact backup, proactive ctx reset.
 
@@ -11,7 +11,7 @@ Config via environment:
   BOT_NAME                 Display name     (default: demobot)
   CLAUDE_CMD               Path to claude
   CLAUDE_MODEL             Model            (default: claude-sonnet-4-6)
-  BOT_CTX_LIMIT_BYTES      Proactive reset threshold (default: 2 MB)
+  BOT_CTX_LIMIT_BYTES      Proactive compact threshold (default: 800 KB)
   BOT_BACKUP_MIN_BYTES     Min .jsonl size to backup (default: 100 KB)
   BOT_BACKUP_KEEP          Session backups to keep   (default: 5)
   DEMOBOT_SILENCE_TIMEOUT  Silence watchdog (default: 600 s)
@@ -84,7 +84,7 @@ LAST_CALL_FILE = (
     / ".claude" / "last_claude_call.txt"
 )
 
-CTX_LIMIT_BYTES  = int(os.getenv("BOT_CTX_LIMIT_BYTES",  str(2 * 1024 * 1024)))
+CTX_LIMIT_BYTES  = int(os.getenv("BOT_CTX_LIMIT_BYTES",  str(800 * 1024)))
 BACKUP_MIN_BYTES = int(os.getenv("BOT_BACKUP_MIN_BYTES", str(100 * 1024)))
 BACKUP_KEEP      = int(os.getenv("BOT_BACKUP_KEEP",      "5"))
 SILENCE_TIMEOUT  = int(os.getenv("DEMOBOT_SILENCE_TIMEOUT", "600"))
@@ -236,6 +236,35 @@ def _session_size(d: str, sid: str) -> int:
         return _transcript_path(d, sid).stat().st_size
     except Exception:
         return 0
+
+
+def _run_compact(d: str, sid: str) -> bool:
+    """Run /compact on the session. Returns True on success, False on failure."""
+    try:
+        log.info("[%s] /compact start sid=%s", MACHINE, sid[:8])
+        result = subprocess.run(
+            [CLAUDE_CMD, "--resume", sid, "-p", "/compact",
+             "--output-format", "stream-json", "--verbose",
+             "--permission-mode", "bypassPermissions"],
+            input="", capture_output=True, text=True, encoding="utf-8",
+            errors="replace", cwd=d, timeout=180,
+        )
+        for line in result.stdout.splitlines():
+            try:
+                ev = json.loads(line)
+                if ev.get("type") == "system" and ev.get("compact_result") == "success":
+                    meta = ev.get("compact_metadata", {})
+                    log.info("[%s] /compact OK: %d→%d tokens sid=%s",
+                             MACHINE, meta.get("pre_tokens", 0), meta.get("post_tokens", 0), sid[:8])
+                    return True
+            except Exception:
+                pass
+        log.warning("[%s] /compact: kein success-Event sid=%s stderr=%s",
+                    MACHINE, sid[:8], result.stderr[:200])
+        return False
+    except Exception as e:
+        log.warning("[%s] /compact fehlgeschlagen: %s", MACHINE, e)
+        return False
 
 
 def _backup_session_jsonl(d: str, sid: str):
@@ -422,7 +451,7 @@ def _run_once(channel: str, d: str, prompt: str, session_id,
 
     proc = subprocess.Popen(
         cmd, cwd=d,
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, encoding="utf-8", errors="replace", bufsize=1,
     )
     _active_proc[channel] = proc
@@ -438,6 +467,17 @@ def _run_once(channel: str, d: str, prompt: str, session_id,
             on_start(proc)
         except Exception:
             pass
+
+    # Stderr-Drainer — liest stderr im Hintergrund damit der Buffer nicht voll läuft
+    _stderr_buf = []
+    def _drain_stderr():
+        try:
+            for line in proc.stderr:
+                _stderr_buf.append(line)
+        except Exception:
+            pass
+    _stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+    _stderr_thread.start()
 
     # Silence watchdog — fires if Claude goes silent for SILENCE_TIMEOUT seconds
     _killed = [False]
@@ -517,13 +557,16 @@ def _run_once(channel: str, d: str, prompt: str, session_id,
             pass
         _active_proc.pop(channel, None)
 
+    _stderr_thread.join(timeout=3)
+    stderr_text = "".join(_stderr_buf)
+
     if reply:
         log.info("[%s] claude DONE ch=%s len=%d sid=%s",
                  MACHINE, channel, len(reply), (new_sid[0] or "")[:8])
     else:
         log.warning("[%s] claude LEER ch=%s — kein Text vom CLI", MACHINE, channel)
 
-    return (reply, new_sid[0])
+    return (reply, new_sid[0], stderr_text)
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -534,7 +577,7 @@ def run_stream(channel: str, user_text: str,
                inbox_dir: str = None, outbox_dir: str = None,
                aufgabe_filter=None, root_id=None, on_session=None):
     """
-    3-layer resilience engine (bot-core v1.6, Windows-adapted).
+    3-layer resilience engine (bot-core v1.7.0, Windows-adapted).
 
     Layer 1 (proactive):  session transcript > CTX_LIMIT_BYTES
                           -> backup + fresh session + reseed
@@ -574,19 +617,24 @@ def run_stream(channel: str, user_text: str,
     resuming       = bool(sid)
     session_resets = 0
 
-    # ── Layer 1: proactive reset when context file exceeds limit ──────────────
+    # ── Layer 1: proactive /compact when context file exceeds limit ───────────
     sz = _session_size(d, sid) if sid else 0
     if sid and sz > CTX_LIMIT_BYTES:
-        log.warning("[%s] Layer 1: ctx %d > %d bytes — fresh session ch=%s",
+        log.warning("[%s] Layer 1: ctx %d > %d bytes — /compact ch=%s",
                     MACHINE, sz, CTX_LIMIT_BYTES, channel)
-        _backup_session_jsonl(d, sid)
-        _save_session(d, channel, None)
-        _say("♻️ Kontext-Limit (proaktiv) — Session gesichert, frischer Start, Kurz-Kontext übernommen.")
-        prompt = (_reseed_prefix(d, channel, aufgabe_filter=aufgabe_filter, root_id=root_id)
-                  + "\n\n---\n\n" + prompt)
-        sid      = None
-        resuming = False
-        session_resets += 1
+        ok = _run_compact(d, sid)
+        if ok:
+            _say("♻️ Session kompaktiert — Kontext erhalten, weiter gehts.")
+        else:
+            log.warning("[%s] Layer 1 fallback: compact fehlgeschlagen → fresh session", MACHINE)
+            _backup_session_jsonl(d, sid)
+            _save_session(d, channel, None)
+            _say("♻️ Kontext-Limit — Session gesichert, frischer Start.")
+            prompt = (_reseed_prefix(d, channel, aufgabe_filter=aufgabe_filter, root_id=root_id)
+                      + "\n\n---\n\n" + prompt)
+            sid      = None
+            resuming = False
+            session_resets += 1
 
     # ── Memory context for brand-new sessions ─────────────────────────────────
     if not sid:
@@ -594,7 +642,7 @@ def run_stream(channel: str, user_text: str,
         if mem:
             prompt = mem + "\n\n---\n\n" + prompt
 
-    reply, new_sid = _run_once(
+    reply, new_sid, _stderr = _run_once(
         channel, d, prompt, sid,
         _inbox, _outbox, extra_append,
         on_progress=on_progress, on_start=on_start, on_session=on_session,
@@ -613,11 +661,12 @@ def run_stream(channel: str, user_text: str,
         retry_prompt = (_reseed_prefix(d, channel,
                                        aufgabe_filter=aufgabe_filter, root_id=root_id)
                         + "\n\n---\n\n" + prompt)
-        reply, new_sid = _run_once(
+        reply, new_sid, _stderr2 = _run_once(
             channel, d, retry_prompt, None,
             _inbox, _outbox, extra_append,
             on_progress=on_progress, on_start=on_start, on_session=on_session,
         )
+        _stderr += _stderr2
         if new_sid:
             _save_session(d, channel, new_sid)
         session_resets += 1
@@ -627,7 +676,7 @@ def run_stream(channel: str, user_text: str,
         log.warning("[%s] Layer 3: empty reply — reset + summary ch=%s", MACHINE, channel)
         _save_session(d, channel, None)
         session_resets += 1
-        reply, new_sid = _run_once(
+        reply, new_sid, _stderr3 = _run_once(
             channel, d,
             "Fasse in 1-2 Saetzen auf Deutsch zusammen was du fuer den User getan hast. "
             "Falls du noch nichts getan hast, beantworte die letzte Anfrage kurz.",
@@ -635,6 +684,7 @@ def run_stream(channel: str, user_text: str,
             _inbox, _outbox, extra_append,
             on_progress=on_progress, on_start=on_start, on_session=on_session,
         )
+        _stderr += _stderr3
         if new_sid:
             _save_session(d, channel, new_sid)
 
@@ -648,6 +698,7 @@ def run_stream(channel: str, user_text: str,
         "session_resets": session_resets,
         "machine":        MACHINE,
         "session_id":     _load_session(d, channel),
+        "stderr":         _stderr,
     }
 
     outfiles = _collect_outbox(_outbox)

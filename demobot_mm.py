@@ -579,18 +579,21 @@ def _is_auth_ok():
             [claude_cmd, "--permission-mode", "bypassPermissions",
              "--output-format", "json", "-p", "x"],
             capture_output=True, text=True, timeout=20, env=env)
-        out = r.stdout + r.stderr
-        return "401" not in out and "Invalid authentication" not in out
+        _auth_signals = ("401 unauthorized", "invalid authentication", "not logged in",
+                         "invalid api key", "authentication required", "unauthenticated")
+        err = (r.stderr or "").lower()
+        return not any(s in err for s in _auth_signals)
     except Exception:
         return False
 
 
 def _start_mm_auth():
-    """Startet `claude auth login`, liest URL, postet sie in den Kanal."""
+    """Startet `claude auth login`, liest URL, postet sie per DM (nicht in Hauptkanal)."""
     global _auth_proc, _auth_pending
+    dm_cid = MM_DM_CHANNEL_ID or MM_CHANNEL_ID
     with _auth_lock:
         if _auth_pending:
-            _post_text("⏳ Login läuft bereits — warte auf deinen Code.")
+            _post_text("⏳ Login läuft bereits — warte auf deinen Code.", channel_id=dm_cid)
             return
     claude_cmd = os.environ.get("CLAUDE_CMD", "claude")
     import subprocess as _sp
@@ -600,7 +603,7 @@ def _start_mm_auth():
             stdin=_sp.PIPE, stdout=_sp.PIPE,
             stderr=_sp.STDOUT, text=True)
     except Exception as e:
-        _post_text(f"❌ Auth-Start fehlgeschlagen: {e}")
+        _post_text(f"❌ Auth-Start fehlgeschlagen: {e}", channel_id=dm_cid)
         return
     url = None
     try:
@@ -612,7 +615,7 @@ def _start_mm_auth():
         pass
     if not url:
         proc.kill()
-        _post_text("❌ Login-URL konnte nicht gelesen werden — starte Bot neu.")
+        _post_text("❌ Login-URL konnte nicht gelesen werden — starte Bot neu.", channel_id=dm_cid)
         return
     with _auth_lock:
         _auth_proc = proc
@@ -621,22 +624,24 @@ def _start_mm_auth():
         "🔑 **Claude-Login erforderlich**\n\n"
         "Öffne diesen Link auf dem Handy:\n\n"
         + url + "\n\n"
-        "Nach dem Login bekommst du einen Code — einfach hier eintippen."
+        "Nach dem Login bekommst du einen Code — einfach hier eintippen.",
+        channel_id=dm_cid
     )
-    log.info("Auth-URL in Kanal gepostet: %s", url)
+    log.info("Auth-URL per DM gepostet: %s", url)
 
 
 def _complete_mm_auth(code_text):
     """Füttert den Auth-Code an den laufenden `claude auth login` Prozess."""
     global _auth_proc, _auth_pending
+    dm_cid = MM_DM_CHANNEL_ID or MM_CHANNEL_ID
     code = _extract_code(code_text)
     if not code:
-        _post_text("❌ Code nicht erkannt — nur den Code eingeben, kein Leerzeichen.")
+        _post_text("❌ Code nicht erkannt — nur den Code eingeben, kein Leerzeichen.", channel_id=dm_cid)
         return
     with _auth_lock:
         proc = _auth_proc
     if not proc:
-        _post_text("❌ Kein Auth-Prozess aktiv — schreibe `neu einloggen` zum Neustart.")
+        _post_text("❌ Kein Auth-Prozess aktiv — schreibe `neu einloggen` zum Neustart.", channel_id=dm_cid)
         return
     try:
         proc.stdin.write(code + "\n")
@@ -647,12 +652,12 @@ def _complete_mm_auth(code_text):
             _auth_pending = False
             _auth_proc = None
         if ret == 0:
-            _post_text("✅ **Login erfolgreich!** Bot läuft wieder normal.")
+            _post_text("✅ **Login erfolgreich!** Bot läuft wieder normal.", channel_id=dm_cid)
             log.info("Auth-Flow abgeschlossen.")
         else:
-            _post_text(f"❌ Login fehlgeschlagen (Exit {ret}) — nochmal versuchen.")
+            _post_text(f"❌ Login fehlgeschlagen (Exit {ret}) — nochmal versuchen.", channel_id=dm_cid)
     except Exception as e:
-        _post_text(f"❌ Auth-Fehler: {e}")
+        _post_text(f"❌ Auth-Fehler: {e}", channel_id=dm_cid)
         with _auth_lock:
             _auth_pending = False
             _auth_proc = None
@@ -698,6 +703,42 @@ def _create_post(msg, channel_id=None, root_id=None):
 
 
 # ── Thread-Topic ──────────────────────────────────────────────────────────────
+
+def _ai_topic_from_thread(root_id: str) -> str:
+    """Thread-Posts saugen, Claude generiert 3-5 Schlagwörter als Topic."""
+    try:
+        r = requests.get(f"{API_BASE}/posts/{root_id}/thread?perPage=50",
+                         headers=AUTH_H, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        posts = data.get("posts", {})
+        order = data.get("order", [])
+        lines = []
+        for pid in order:
+            p = posts.get(pid, {})
+            msg = (p.get("message") or "").strip()
+            if msg and not msg.startswith("✅") and not msg.startswith("❌"):
+                lines.append(msg[:300])
+        thread_text = "\n".join(lines[:20])
+        prompt = (
+            "Lies diesen Mattermost-Thread und gib NUR 3-5 deutsche Schlagwörter zurück "
+            "die den Kern beschreiben (Kunde, Aktion, Problemstellung o.ä.). "
+            "Format: WORT1 WORT2 WORT3 — kein Satz, keine Erklärung, nur die Schlagwörter.\n\n"
+            f"Thread:\n{thread_text}"
+        )
+        import subprocess as _sp
+        claude_cmd = os.environ.get("CLAUDE_CMD", "claude")
+        result = _sp.run(
+            [claude_cmd, "--permission-mode", "bypassPermissions",
+             "--output-format", "text", "-p", prompt],
+            capture_output=True, text=True, timeout=30, env={**os.environ}
+        )
+        topic = result.stdout.strip().splitlines()[0].strip()
+        return topic if topic else "AI-Topic"
+    except Exception as e:
+        log.warning("AI-Topic fehlgeschlagen: %s", e)
+        return "AI-Topic"
+
 
 def _set_thread_topic(root_id: str, topic: str, channel_id: str = "") -> str:
     """### Titel ### als Prefix auf den Aufgaben-Hauptpost im Channel setzen.
@@ -1026,8 +1067,11 @@ def _process(text, files, sender="user", aufgabe_id=None, reply_channel_id=None)
             meta = getattr(core.run_stream, "last_meta", {})
             dauer_s = meta.get("dauer_s", round(time.time() - t_start, 1))
             session_resets = meta.get("session_resets", 0)
-            # 401 → Auth-Flow starten
-            if reply and ("401" in reply or "Invalid authentication" in reply):
+            # 401 → Auth-Flow starten (nur stderr prüfen, nicht reply — False-Positive-Schutz)
+            _auth_signals = ("401 unauthorized", "invalid authentication", "not logged in",
+                             "invalid api key", "authentication required", "unauthenticated")
+            _stderr_low = (meta.get("stderr") or "").lower()
+            if any(s in _stderr_low for s in _auth_signals):
                 log.warning("[%s] Claude-401 erkannt — starte MM-Auth-Flow", core.MACHINE)
                 threading.Thread(target=_start_mm_auth, daemon=True).start()
             if tk["status"] == "abgebrochen":
@@ -1542,6 +1586,8 @@ async def event_handler(message):
     _set_topic_m = re.match(r'^set\s+topic\s+(.+)$', _raw_msg, re.IGNORECASE)
     if _set_topic_m:
         topic_text = _set_topic_m.group(1).strip()
+        if topic_text.lower() == "ai":
+            topic_text = _ai_topic_from_thread(_topic_root)
         _post_text(_set_thread_topic(_topic_root, topic_text, _rcid), _rcid, _thread)
         return
 
@@ -1587,9 +1633,13 @@ def main():
                 log.warning("Claude-Auth ungültig — starte MM-Auth-Flow")
                 threading.Thread(target=_start_mm_auth, daemon=True).start()
             _ws_last_activity[0] = time.time()  # reset bei neuer Verbindung
+            log.info("WebSocket startet…")
             driver.init_websocket(event_handler)
             log.warning("WebSocket beendet — reconnect in 5s")
-        except Exception:
+        except (SystemExit, KeyboardInterrupt) as e:
+            log.error("FATAL: %s — Bot beendet sich", type(e).__name__, exc_info=True)
+            raise
+        except BaseException:
             log.exception("Verbindungsfehler — reconnect in 5s")
         time.sleep(5)
 

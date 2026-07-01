@@ -67,7 +67,13 @@ Danach dem User KURZ bestätigen: **„Notiert ✅ — ich melde mich im Kanal, 
 - Scripts ausführen die Daten verändern
 - Dienste starten/stoppen/deployen
 
-**Was ist GO:** Explizites "GO", "ja mach", "mach es" — nichts anderes.
+**Was ist GO:** Explizites "GO", "ja mach", "mach es" — und folgende **implizite GOs** (sofort umsetzen, nicht nachfragen):
+- "alles fertig bauen", "bau das fertig", "mach fertig"
+- "das kannst du selber"
+- "mach weiter", "weiter", "naechster Schritt"
+- "deploy", "starten" — Aktion direkt gemeint
+- Imperativ-Verb + bekannter Plan = GO
+
 **Was ist kein GO:** Eine Beschreibung, "klingt gut", Schweigen.
 **STOP:** Sofort unterbrechen, Status ausgeben, warten.
 
